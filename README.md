@@ -24,4 +24,4 @@ git apply path/to/ct.patch
 
 ### Chromium binary
 
-We also provide a pre-built Linux x64 binary for Chromium [here](https://github.com/PLSysSec/ct-wasm-spec/releases/download/artifact/linux_x86_64_ct-chrome.zip).
+We also provide a pre-built Linux x86_64 binary for Chromium [here](https://github.com/PLSysSec/ct-wasm-spec/releases/download/artifact/linux_x86_64_ct-chrome.zip).
