@@ -1,0 +1,2793 @@
+From b7f18e52c371edd7a87bad774e3e81aecab09f9b Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Mon, 9 Apr 2018 13:55:51 -0700
+Subject: [PATCH 01/15] Separate ValueType from MachineRepresentation
+
+---
+ src/compiler/wasm-compiler.cc         | 44 +++++++++++++++++++++------
+ src/wasm/baseline/liftoff-compiler.cc |  2 +-
+ src/wasm/function-body-decoder-impl.h | 29 +++++++++---------
+ src/wasm/function-body-decoder.cc     |  2 +-
+ src/wasm/wasm-debug.cc                |  2 +-
+ src/wasm/wasm-interpreter.cc          |  4 +--
+ src/wasm/wasm-objects.h               |  2 --
+ src/wasm/wasm-opcodes.h               | 18 +++++++++--
+ 8 files changed, 70 insertions(+), 33 deletions(-)
+
+diff --git a/src/compiler/wasm-compiler.cc b/src/compiler/wasm-compiler.cc
+index 9bbf5f3a3f..49d5f9047c 100644
+--- a/src/compiler/wasm-compiler.cc
++++ b/src/compiler/wasm-compiler.cc
+@@ -76,9 +76,12 @@ bool ContainsSimd(wasm::FunctionSig* sig) {
+   }
+   return false;
+ }
+-
+ }  // namespace
+ 
++int ElementSizeLog2Of(wasm::ValueType rep) {
++  return ElementSizeLog2Of(MachineRepresentation(rep));
++}
++
+ WasmGraphBuilder::WasmGraphBuilder(
+     ModuleEnv* env, Zone* zone, JSGraph* jsgraph, Handle<Code> centry_stub,
+     wasm::FunctionSig* sig,
+@@ -167,7 +170,7 @@ Node* WasmGraphBuilder::Phi(wasm::ValueType type, unsigned count, Node** vals,
+   DCHECK(IrOpcode::IsMergeOpcode(control->opcode()));
+   Node** buf = Realloc(vals, count, count + 1);
+   buf[count] = control;
+-  return graph()->NewNode(jsgraph()->common()->Phi(type, count), count + 1,
++  return graph()->NewNode(jsgraph()->common()->Phi(MachineRepresentation(type), count), count + 1,
+                           buf);
+ }
+ 
+@@ -3303,7 +3306,7 @@ void WasmGraphBuilder::BuildCWasmEntry(Address wasm_context_address) {
+   // Store the return value.
+   DCHECK_GE(1, sig_->return_count());
+   if (sig_->return_count() == 1) {
+-    StoreRepresentation store_rep(sig_->GetReturn(), kNoWriteBarrier);
++    StoreRepresentation store_rep(MachineRepresentation(sig_->GetReturn()), kNoWriteBarrier);
+     Node* store =
+         graph()->NewNode(jsgraph()->machine()->Store(store_rep), arg_buffer,
+                          Int32Constant(0), call, *effect_, *control_);
+@@ -3318,7 +3321,7 @@ void WasmGraphBuilder::BuildCWasmEntry(Address wasm_context_address) {
+         MachineRepresentation::kTagged,  // arg0 (code)
+         MachineRepresentation::kTagged   // arg1 (buffer)
+     };
+-    wasm::FunctionSig c_entry_sig(1, 2, sig_reps);
++    Signature<MachineRepresentation> c_entry_sig(1, 2, sig_reps);
+     Int64Lowering r(jsgraph()->graph(), jsgraph()->machine(),
+                     jsgraph()->common(), jsgraph()->zone(), &c_entry_sig);
+     r.LowerGraph();
+@@ -3688,7 +3691,7 @@ const Operator* WasmGraphBuilder::GetSafeLoadOperator(int offset,
+                                                       wasm::ValueType type) {
+   int alignment = offset % (1 << ElementSizeLog2Of(type));
+   MachineType mach_type = wasm::WasmOpcodes::MachineTypeFor(type);
+-  if (alignment == 0 || jsgraph()->machine()->UnalignedLoadSupported(type)) {
++  if (alignment == 0 || jsgraph()->machine()->UnalignedLoadSupported(MachineRepresentation(type))) {
+     return jsgraph()->machine()->Load(mach_type);
+   }
+   return jsgraph()->machine()->UnalignedLoad(mach_type);
+@@ -3697,8 +3700,8 @@ const Operator* WasmGraphBuilder::GetSafeLoadOperator(int offset,
+ const Operator* WasmGraphBuilder::GetSafeStoreOperator(int offset,
+                                                        wasm::ValueType type) {
+   int alignment = offset % (1 << ElementSizeLog2Of(type));
+-  if (alignment == 0 || jsgraph()->machine()->UnalignedStoreSupported(type)) {
+-    StoreRepresentation rep(type, WriteBarrierKind::kNoWriteBarrier);
++  if (alignment == 0 || jsgraph()->machine()->UnalignedStoreSupported(MachineRepresentation(type))) {
++    StoreRepresentation rep(MachineRepresentation(type), WriteBarrierKind::kNoWriteBarrier);
+     return jsgraph()->machine()->Store(rep);
+   }
+   UnalignedStoreRepresentation rep(type);
+@@ -3949,13 +3952,27 @@ Graph* WasmGraphBuilder::graph() { return jsgraph()->graph(); }
+ 
+ void WasmGraphBuilder::LowerInt64() {
+   if (jsgraph()->machine()->Is64()) return;
++  Signature<MachineRepresentation>::Builder sig_builder(jsgraph()->zone(), sig_->return_count(), sig_->parameter_count());
++  for(auto r : sig_->returns()) {
++    sig_builder.AddReturn(MachineRepresentation(r));
++  }
++  for(auto p : sig_->parameters()) {
++    sig_builder.AddReturn(MachineRepresentation(p));
++  }
+   Int64Lowering r(jsgraph()->graph(), jsgraph()->machine(), jsgraph()->common(),
+-                  jsgraph()->zone(), sig_);
++                  jsgraph()->zone(), sig_builder.Build());
+   r.LowerGraph();
+ }
+ 
+ void WasmGraphBuilder::SimdScalarLoweringForTesting() {
+-  SimdScalarLowering(jsgraph(), sig_).LowerGraph();
++  Signature<MachineRepresentation>::Builder sig_builder(jsgraph()->zone(), sig_->return_count(), sig_->parameter_count());
++  for(auto r : sig_->returns()) {
++    sig_builder.AddReturn(MachineRepresentation(r));
++  }
++  for(auto p : sig_->parameters()) {
++    sig_builder.AddReturn(MachineRepresentation(p));
++  }
++  SimdScalarLowering(jsgraph(), sig_builder.Build()).LowerGraph();
+ }
+ 
+ void WasmGraphBuilder::SetSourcePosition(Node* node,
+@@ -4942,7 +4959,14 @@ SourcePositionTable* WasmCompilationUnit::BuildGraphForWasmFunction(
+ 
+   if (builder.has_simd() &&
+       (!CpuFeatures::SupportsWasmSimd128() || lower_simd_)) {
+-    SimdScalarLowering(tf_.jsgraph_, func_body_.sig).LowerGraph();
++    Signature<MachineRepresentation>::Builder sig_builder(tf_.jsgraph_->zone(), func_body_.sig->return_count(), func_body_.sig->parameter_count());
++    for(auto r : func_body_.sig->returns()) {
++      sig_builder.AddReturn(MachineRepresentation(r));
++    }
++    for(auto p : func_body_.sig->parameters()) {
++      sig_builder.AddReturn(MachineRepresentation(p));
++    }
++    SimdScalarLowering(tf_.jsgraph_, sig_builder.Build()).LowerGraph();
+   }
+ 
+   if (func_index_ >= FLAG_trace_wasm_ast_start &&
+diff --git a/src/wasm/baseline/liftoff-compiler.cc b/src/wasm/baseline/liftoff-compiler.cc
+index 255ee0347e..4ccf02b64f 100644
+--- a/src/wasm/baseline/liftoff-compiler.cc
++++ b/src/wasm/baseline/liftoff-compiler.cc
+@@ -925,7 +925,7 @@ class LiftoffCompiler {
+       AddOutOfLineTrap(decoder->position(), protected_store_pc);
+     }
+     if (FLAG_wasm_trace_memory) {
+-      TraceMemoryOperation(true, type.mem_rep(), index, operand.offset,
++      TraceMemoryOperation(true, MachineRepresentation(type.mem_rep()), index, operand.offset,
+                            decoder->position());
+     }
+   }
+diff --git a/src/wasm/function-body-decoder-impl.h b/src/wasm/function-body-decoder-impl.h
+index 04d918b0a4..eb8c7a8355 100644
+--- a/src/wasm/function-body-decoder-impl.h
++++ b/src/wasm/function-body-decoder-impl.h
+@@ -410,9 +410,10 @@ struct ValueBase {
+ template <typename Value>
+ struct Merge {
+   uint32_t arity;
+-  union {
++  union V {
+     Value* array;
+     Value first;
++    V() : first() {}
+   } vals;  // Either multiple values or a single value.
+ 
+   // Tracks whether this merge was ever reached. Uses precise reachability, like
+@@ -2028,7 +2029,7 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+   unsigned SimdExtractLane(WasmOpcode opcode, ValueType type) {
+     SimdLaneOperand<validate> operand(this, this->pc_);
+     if (this->Validate(this->pc_, opcode, operand)) {
+-      Value inputs[] = {Pop(0, ValueType::kSimd128)};
++      Value inputs[] = {Pop(0, kWasmS128)};
+       auto* result = Push(type);
+       CALL_INTERFACE_IF_REACHABLE(SimdLaneOp, opcode, operand,
+                                   ArrayVector(inputs), result);
+@@ -2041,8 +2042,8 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+     if (this->Validate(this->pc_, opcode, operand)) {
+       Value inputs[2];
+       inputs[1] = Pop(1, type);
+-      inputs[0] = Pop(0, ValueType::kSimd128);
+-      auto* result = Push(ValueType::kSimd128);
++      inputs[0] = Pop(0, kWasmS128);
++      auto* result = Push(kWasmS128);
+       CALL_INTERFACE_IF_REACHABLE(SimdLaneOp, opcode, operand,
+                                   ArrayVector(inputs), result);
+     }
+@@ -2052,8 +2053,8 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+   unsigned SimdShiftOp(WasmOpcode opcode) {
+     SimdShiftOperand<validate> operand(this, this->pc_);
+     if (this->Validate(this->pc_, opcode, operand)) {
+-      auto input = Pop(0, ValueType::kSimd128);
+-      auto* result = Push(ValueType::kSimd128);
++      auto input = Pop(0, kWasmS128);
++      auto* result = Push(kWasmS128);
+       CALL_INTERFACE_IF_REACHABLE(SimdShiftOp, opcode, operand, input, result);
+     }
+     return operand.length;
+@@ -2062,9 +2063,9 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+   unsigned Simd8x16ShuffleOp() {
+     Simd8x16ShuffleOperand<validate> operand(this, this->pc_);
+     if (this->Validate(this->pc_, operand)) {
+-      auto input1 = Pop(1, ValueType::kSimd128);
+-      auto input0 = Pop(0, ValueType::kSimd128);
+-      auto* result = Push(ValueType::kSimd128);
++      auto input1 = Pop(1, kWasmS128);
++      auto input0 = Pop(0, kWasmS128);
++      auto* result = Push(kWasmS128);
+       CALL_INTERFACE_IF_REACHABLE(Simd8x16ShuffleOp, operand, input0, input1,
+                                   result);
+     }
+@@ -2075,23 +2076,23 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+     unsigned len = 0;
+     switch (opcode) {
+       case kExprF32x4ExtractLane: {
+-        len = SimdExtractLane(opcode, ValueType::kFloat32);
++        len = SimdExtractLane(opcode, kWasmF32);
+         break;
+       }
+       case kExprI32x4ExtractLane:
+       case kExprI16x8ExtractLane:
+       case kExprI8x16ExtractLane: {
+-        len = SimdExtractLane(opcode, ValueType::kWord32);
++        len = SimdExtractLane(opcode, kWasmI32);
+         break;
+       }
+       case kExprF32x4ReplaceLane: {
+-        len = SimdReplaceLane(opcode, ValueType::kFloat32);
++        len = SimdReplaceLane(opcode, kWasmF32);
+         break;
+       }
+       case kExprI32x4ReplaceLane:
+       case kExprI16x8ReplaceLane:
+       case kExprI8x16ReplaceLane: {
+-        len = SimdReplaceLane(opcode, ValueType::kWord32);
++        len = SimdReplaceLane(opcode, kWasmI32);
+         break;
+       }
+       case kExprI32x4Shl:
+@@ -2162,7 +2163,7 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+           this, this->pc_ + 1, ElementSizeLog2Of(memtype.representation()));
+       len += operand.length;
+       PopArgs(sig);
+-      auto result = ret_type == MachineRepresentation::kNone
++      auto result = MachineRepresentation(ret_type) == MachineRepresentation::kNone
+                         ? nullptr
+                         : Push(GetReturnType(sig));
+       CALL_INTERFACE_IF_REACHABLE(AtomicOp, opcode, vec2vec(args_), operand,
+diff --git a/src/wasm/function-body-decoder.cc b/src/wasm/function-body-decoder.cc
+index 57ee78f91c..08be93cb43 100644
+--- a/src/wasm/function-body-decoder.cc
++++ b/src/wasm/function-body-decoder.cc
+@@ -351,7 +351,7 @@ class WasmGraphBuildingInterface {
+   void StoreMem(Decoder* decoder, StoreType type,
+                 const MemoryAccessOperand<validate>& operand,
+                 const Value& index, const Value& value) {
+-    BUILD(StoreMem, type.mem_rep(), index.node, operand.offset,
++    BUILD(StoreMem, MachineRepresentation(type.mem_rep()), index.node, operand.offset,
+           operand.alignment, value.node, decoder->position(),
+           type.value_type());
+   }
+diff --git a/src/wasm/wasm-debug.cc b/src/wasm/wasm-debug.cc
+index 87995df4e6..76719a23f4 100644
+--- a/src/wasm/wasm-debug.cc
++++ b/src/wasm/wasm-debug.cc
+@@ -177,7 +177,7 @@ class InterpreterHandle {
+     ScopedVector<WasmValue> wasm_args(num_params);
+     uint8_t* arg_buf_ptr = arg_buffer;
+     for (int i = 0; i < num_params; ++i) {
+-      uint32_t param_size = 1 << ElementSizeLog2Of(sig->GetParam(i));
++      uint32_t param_size = 1 << ElementSizeLog2Of(MachineRepresentation(sig->GetParam(i)));
+ #define CASE_ARG_TYPE(type, ctype)                                    \
+   case type:                                                          \
+     DCHECK_EQ(param_size, sizeof(ctype));                             \
+diff --git a/src/wasm/wasm-interpreter.cc b/src/wasm/wasm-interpreter.cc
+index 2f8fb0bf4a..fb5ea036b3 100644
+--- a/src/wasm/wasm-interpreter.cc
++++ b/src/wasm/wasm-interpreter.cc
+@@ -2349,7 +2349,7 @@ class ThreadImpl {
+     size_t offset = 0;
+     WasmValue* wasm_args = sp_ - num_args;
+     for (int i = 0; i < num_args; ++i) {
+-      uint32_t param_size = 1 << ElementSizeLog2Of(sig->GetParam(i));
++      uint32_t param_size = 1 << ElementSizeLog2Of(MachineRepresentation(sig->GetParam(i)));
+       if (arg_buffer.size() < offset + param_size) {
+         arg_buffer.resize(std::max(2 * arg_buffer.size(), offset + param_size));
+       }
+@@ -2380,7 +2380,7 @@ class ThreadImpl {
+     // value(s).
+     uint32_t return_size = 0;
+     for (ValueType t : sig->returns()) {
+-      return_size += 1 << ElementSizeLog2Of(t);
++      return_size += 1 << ElementSizeLog2Of(MachineRepresentation(t));
+     }
+     if (arg_buffer.size() < return_size) {
+       arg_buffer.resize(return_size);
+diff --git a/src/wasm/wasm-objects.h b/src/wasm/wasm-objects.h
+index cecc11f83f..ec06531b5c 100644
+--- a/src/wasm/wasm-objects.h
++++ b/src/wasm/wasm-objects.h
+@@ -30,8 +30,6 @@ class WasmCode;
+ struct WasmModule;
+ class SignatureMap;
+ typedef Address GlobalHandleAddress;
+-using ValueType = MachineRepresentation;
+-using FunctionSig = Signature<ValueType>;
+ }  // namespace wasm
+ 
+ class WasmCompiledModule;
+diff --git a/src/wasm/wasm-opcodes.h b/src/wasm/wasm-opcodes.h
+index 9f8232c902..70f1260918 100644
+--- a/src/wasm/wasm-opcodes.h
++++ b/src/wasm/wasm-opcodes.h
+@@ -17,7 +17,21 @@ namespace wasm {
+ 
+ // We reuse the internal machine type to represent WebAssembly types.
+ // A typedef improves readability without adding a whole new type system.
+-using ValueType = MachineRepresentation;
++class ValueType {
++  public:
++    constexpr ValueType() : v(0) {}
++    constexpr ValueType(MachineRepresentation v) : v(static_cast<uint8_t>(v)) {}
++    constexpr explicit operator MachineRepresentation() const {
++      return static_cast<MachineRepresentation>(this->v % static_cast<uint8_t>(MachineRepresentation::kLastRepresentation));
++    }
++
++    constexpr operator uint8_t() const {
++      return static_cast<uint8_t>(this->v);
++    }
++  private:
++    uint8_t v;
++};
++
+ constexpr ValueType kWasmStmt = MachineRepresentation::kNone;
+ constexpr ValueType kWasmI32 = MachineRepresentation::kWord32;
+ constexpr ValueType kWasmI64 = MachineRepresentation::kWord64;
+@@ -658,7 +672,7 @@ class V8_EXPORT_PRIVATE WasmOpcodes {
+     return MemSize(type.representation());
+   }
+ 
+-  static byte MemSize(ValueType type) { return 1 << ElementSizeLog2Of(type); }
++  static byte MemSize(ValueType type) { return 1 << ElementSizeLog2Of(MachineRepresentation(type)); }
+ 
+   static ValueTypeCode ValueTypeCodeFor(ValueType type) {
+     switch (type) {
+-- 
+2.15.0
+
+
+From fd01001949f5b6f0f48e67ba467698e51cd4fc69 Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Mon, 9 Apr 2018 20:03:34 -0700
+Subject: [PATCH 02/15] 32bit secrets on the stack
+
+---
+ src/compiler/wasm-compiler.cc         | 111 +++++++++++++++++++++++++-
+ src/compiler/wasm-compiler.h          |   2 +
+ src/compiler/wasm-linkage.cc          |   4 +
+ src/wasm/baseline/liftoff-compiler.cc |   4 +
+ src/wasm/function-body-decoder-impl.h |  72 ++++++++++++++++-
+ src/wasm/function-body-decoder.cc     |  15 ++++
+ src/wasm/module-decoder.cc            |   4 +
+ src/wasm/wasm-constants.h             |   2 +
+ src/wasm/wasm-debug.cc                |   4 +-
+ src/wasm/wasm-opcodes.cc              |  13 +++
+ src/wasm/wasm-opcodes.h               |  62 +++++++++++++-
+ 11 files changed, 287 insertions(+), 6 deletions(-)
+
+diff --git a/src/compiler/wasm-compiler.cc b/src/compiler/wasm-compiler.cc
+index 49d5f9047c..b18917e618 100644
+--- a/src/compiler/wasm-compiler.cc
++++ b/src/compiler/wasm-compiler.cc
+@@ -275,12 +275,15 @@ Node* WasmGraphBuilder::Binop(wasm::WasmOpcode opcode, Node* left, Node* right,
+   MachineOperatorBuilder* m = jsgraph()->machine();
+   switch (opcode) {
+     case wasm::kExprI32Add:
++    case wasm::kExprS32Add:
+       op = m->Int32Add();
+       break;
+     case wasm::kExprI32Sub:
++    case wasm::kExprS32Sub:
+       op = m->Int32Sub();
+       break;
+     case wasm::kExprI32Mul:
++    case wasm::kExprS32Mul:
+       op = m->Int32Mul();
+       break;
+     case wasm::kExprI32DivS:
+@@ -292,63 +295,81 @@ Node* WasmGraphBuilder::Binop(wasm::WasmOpcode opcode, Node* left, Node* right,
+     case wasm::kExprI32RemU:
+       return BuildI32RemU(left, right, position);
+     case wasm::kExprI32And:
++    case wasm::kExprS32And:
+       op = m->Word32And();
+       break;
+     case wasm::kExprI32Ior:
++    case wasm::kExprS32Ior:
+       op = m->Word32Or();
+       break;
+     case wasm::kExprI32Xor:
++    case wasm::kExprS32Xor:
+       op = m->Word32Xor();
+       break;
+     case wasm::kExprI32Shl:
++    case wasm::kExprS32Shl:
+       op = m->Word32Shl();
+       right = MaskShiftCount32(right);
+       break;
+     case wasm::kExprI32ShrU:
++    case wasm::kExprS32ShrU:
+       op = m->Word32Shr();
+       right = MaskShiftCount32(right);
+       break;
+     case wasm::kExprI32ShrS:
++    case wasm::kExprS32ShrS:
+       op = m->Word32Sar();
+       right = MaskShiftCount32(right);
+       break;
+     case wasm::kExprI32Ror:
++    case wasm::kExprS32Ror:
+       op = m->Word32Ror();
+       right = MaskShiftCount32(right);
+       break;
+     case wasm::kExprI32Rol:
++    case wasm::kExprS32Rol:
+       right = MaskShiftCount32(right);
+       return BuildI32Rol(left, right);
+     case wasm::kExprI32Eq:
++    case wasm::kExprS32Eq:
+       op = m->Word32Equal();
+       break;
+     case wasm::kExprI32Ne:
++    case wasm::kExprS32Ne:
+       return Invert(Binop(wasm::kExprI32Eq, left, right));
+     case wasm::kExprI32LtS:
++    case wasm::kExprS32LtS:
+       op = m->Int32LessThan();
+       break;
+     case wasm::kExprI32LeS:
++    case wasm::kExprS32LeS:
+       op = m->Int32LessThanOrEqual();
+       break;
+     case wasm::kExprI32LtU:
++    case wasm::kExprS32LtU:
+       op = m->Uint32LessThan();
+       break;
+     case wasm::kExprI32LeU:
++    case wasm::kExprS32LeU:
+       op = m->Uint32LessThanOrEqual();
+       break;
+     case wasm::kExprI32GtS:
++    case wasm::kExprS32GtS:
+       op = m->Int32LessThan();
+       std::swap(left, right);
+       break;
+     case wasm::kExprI32GeS:
++    case wasm::kExprS32GeS:
+       op = m->Int32LessThanOrEqual();
+       std::swap(left, right);
+       break;
+     case wasm::kExprI32GtU:
++    case wasm::kExprS32GtU:
+       op = m->Uint32LessThan();
+       std::swap(left, right);
+       break;
+     case wasm::kExprI32GeU:
++    case wasm::kExprS32GeU:
+       op = m->Uint32LessThanOrEqual();
+       std::swap(left, right);
+       break;
+@@ -544,6 +565,7 @@ Node* WasmGraphBuilder::Unop(wasm::WasmOpcode opcode, Node* input,
+   MachineOperatorBuilder* m = jsgraph()->machine();
+   switch (opcode) {
+     case wasm::kExprI32Eqz:
++    case wasm::kExprS32Eqz:
+       op = m->Word32Equal();
+       return graph()->NewNode(op, input, jsgraph()->Int32Constant(0));
+     case wasm::kExprF32Abs:
+@@ -619,9 +641,11 @@ Node* WasmGraphBuilder::Unop(wasm::WasmOpcode opcode, Node* input,
+       op = m->BitcastFloat32ToInt32();
+       break;
+     case wasm::kExprI32Clz:
++    case wasm::kExprS32Clz:
+       op = m->Word32Clz();
+       break;
+-    case wasm::kExprI32Ctz: {
++    case wasm::kExprI32Ctz:
++    case wasm::kExprS32Ctz: {
+       if (m->Word32Ctz().IsSupported()) {
+         op = m->Word32Ctz().op();
+         break;
+@@ -633,7 +657,8 @@ Node* WasmGraphBuilder::Unop(wasm::WasmOpcode opcode, Node* input,
+         return BuildI32Ctz(input);
+       }
+     }
+-    case wasm::kExprI32Popcnt: {
++    case wasm::kExprI32Popcnt:
++    case wasm::kExprS32Popcnt: {
+       if (m->Word32Popcnt().IsSupported()) {
+         op = m->Word32Popcnt().op();
+         break;
+@@ -1041,12 +1066,14 @@ Node* WasmGraphBuilder::BuildChangeEndiannessStore(
+       value = graph()->NewNode(m->BitcastFloat64ToInt64(), node);
+       isFloat = true;
+     case wasm::kWasmI64:
++    case wasm::kWasmS64:
+       result = jsgraph()->Int64Constant(0);
+       break;
+     case wasm::kWasmF32:
+       value = graph()->NewNode(m->BitcastFloat32ToInt32(), node);
+       isFloat = true;
+     case wasm::kWasmI32:
++    case wasm::kWasmS32:
+       result = jsgraph()->Int32Constant(0);
+       break;
+     case wasm::kWasmS128:
+@@ -2684,9 +2711,11 @@ Node* WasmGraphBuilder::BuildChangeFloat64ToTagged(Node* value) {
+ Node* WasmGraphBuilder::ToJS(Node* node, wasm::ValueType type) {
+   switch (type) {
+     case wasm::kWasmI32:
++    case wasm::kWasmS32:
+       return BuildChangeInt32ToTagged(node);
+     case wasm::kWasmS128:
+     case wasm::kWasmI64:
++    case wasm::kWasmS64:
+       UNREACHABLE();
+     case wasm::kWasmF32:
+       node = graph()->NewNode(jsgraph()->machine()->ChangeFloat32ToFloat64(),
+@@ -2783,13 +2812,15 @@ Node* WasmGraphBuilder::FromJS(Node* node, Node* js_context,
+   num = BuildChangeTaggedToFloat64(num);
+ 
+   switch (type) {
+-    case wasm::kWasmI32: {
++    case wasm::kWasmI32:
++    case wasm::kWasmS32: {
+       num = graph()->NewNode(jsgraph()->machine()->TruncateFloat64ToWord32(),
+                              num);
+       break;
+     }
+     case wasm::kWasmS128:
+     case wasm::kWasmI64:
++    case wasm::kWasmS64:
+       UNREACHABLE();
+     case wasm::kWasmF32:
+       num = graph()->NewNode(jsgraph()->machine()->TruncateFloat64ToFloat32(),
+@@ -3987,6 +4018,80 @@ Node* WasmGraphBuilder::S128Zero() {
+   return graph()->NewNode(jsgraph()->machine()->S128Zero());
+ }
+ 
++
++Node* WasmGraphBuilder::SecretOp(wasm::WasmOpcode opcode, Node* const* inputs) {
++  MachineOperatorBuilder* m = jsgraph()->machine();
++  switch(opcode) {
++    case wasm::kExprS32Eqz:
++      return graph()->NewNode(m->Word32Equal(), inputs[0], jsgraph()->Int32Constant(0));
++    case wasm::kExprS32Clz:
++      return graph()->NewNode(m->Word32Clz(), inputs[0]);
++      break;
++    case wasm::kExprS32Ctz: {
++      if (m->Word32Ctz().IsSupported()) {
++        return graph()->NewNode(m->Word32Ctz().op(), inputs[0]);
++        break;
++      } else if (m->Word32ReverseBits().IsSupported()) {
++        Node* reversed = graph()->NewNode(m->Word32ReverseBits().op(), inputs[0]);
++        Node* result = graph()->NewNode(m->Word32Clz(), reversed);
++        return result;
++      } else {
++        return BuildI32Ctz(inputs[0]);
++      }
++    }
++    case wasm::kExprS32Popcnt: {
++      if (m->Word32Popcnt().IsSupported()) {
++        return graph()->NewNode(m->Word32Popcnt().op(), inputs[0]);
++      } else {
++        return BuildI32Popcnt(inputs[0]);
++      }
++    }
++    case wasm::kExprS32Add:
++      return graph()->NewNode(m->Int32Add(), inputs[0], inputs[1]);
++    case wasm::kExprS32Sub:
++      return graph()->NewNode(m->Int32Sub(), inputs[0], inputs[1]);
++    case wasm::kExprS32Mul:
++      return graph()->NewNode(m->Int32Mul(), inputs[0], inputs[1]);
++    case wasm::kExprS32And:
++      return graph()->NewNode(m->Word32And(), inputs[0], inputs[1]);
++    case wasm::kExprS32Ior:
++      return graph()->NewNode(m->Word32Or(), inputs[0], inputs[1]);
++    case wasm::kExprS32Xor:
++      return graph()->NewNode(m->Word32Xor(), inputs[0], inputs[1]);
++    case wasm::kExprS32Shl:
++      return graph()->NewNode(m->Word32Shl(), inputs[0], MaskShiftCount32(inputs[1]));
++    case wasm::kExprS32ShrU:
++      return graph()->NewNode(m->Word32Shr(), inputs[0], MaskShiftCount32(inputs[1]));
++    case wasm::kExprS32ShrS:
++      return graph()->NewNode(m->Word32Sar(), inputs[0], MaskShiftCount32(inputs[1]));
++    case wasm::kExprS32Ror:
++      return graph()->NewNode(m->Word32Ror(), inputs[0], MaskShiftCount32(inputs[1]));
++    case wasm::kExprS32Rol:
++      return BuildI32Rol(inputs[0], MaskShiftCount32(inputs[1]));
++    case wasm::kExprS32Eq:
++      return graph()->NewNode(m->Word32Equal(), inputs[0], inputs[1]);
++    case wasm::kExprS32Ne:
++      return Invert(SecretOp(wasm::kExprS32Eq, inputs));
++    case wasm::kExprS32LtS:
++      return graph()->NewNode(m->Int32LessThan(), inputs[0], inputs[1]);
++    case wasm::kExprS32LeS:
++      return graph()->NewNode(m->Int32LessThanOrEqual(), inputs[0], inputs[1]);
++    case wasm::kExprS32LtU:
++      return graph()->NewNode(m->Uint32LessThan(), inputs[0], inputs[1]);
++    case wasm::kExprS32LeU:
++      return graph()->NewNode(m->Uint32LessThanOrEqual(), inputs[0], inputs[1]);
++    case wasm::kExprS32GtS:
++      return graph()->NewNode(m->Int32LessThan(), inputs[1], inputs[0]);
++    case wasm::kExprS32GeS:
++      return graph()->NewNode(m->Int32LessThanOrEqual(), inputs[1], inputs[0]);
++    case wasm::kExprS32GtU:
++      return graph()->NewNode(m->Uint32LessThan(), inputs[1], inputs[0]);
++    case wasm::kExprS32GeU:
++      return graph()->NewNode(m->Uint32LessThanOrEqual(), inputs[1], inputs[0]);
++    default:
++      FATAL_UNSUPPORTED_OPCODE(opcode);
++  }
++}
+ Node* WasmGraphBuilder::SimdOp(wasm::WasmOpcode opcode, Node* const* inputs) {
+   has_simd_ = true;
+   switch (opcode) {
+diff --git a/src/compiler/wasm-compiler.h b/src/compiler/wasm-compiler.h
+index 22a2e1071e..8c90512916 100644
+--- a/src/compiler/wasm-compiler.h
++++ b/src/compiler/wasm-compiler.h
+@@ -434,6 +434,8 @@ class WasmGraphBuilder {
+ 
+   Node* SimdOp(wasm::WasmOpcode opcode, Node* const* inputs);
+ 
++  Node* SecretOp(wasm::WasmOpcode opcode, Node* const* inputs);
++
+   Node* SimdLaneOp(wasm::WasmOpcode opcode, uint8_t lane, Node* const* inputs);
+ 
+   Node* SimdShiftOp(wasm::WasmOpcode opcode, uint8_t shift,
+diff --git a/src/compiler/wasm-linkage.cc b/src/compiler/wasm-linkage.cc
+index e7bb3c164a..c8c6a99775 100644
+--- a/src/compiler/wasm-linkage.cc
++++ b/src/compiler/wasm-linkage.cc
+@@ -26,6 +26,10 @@ MachineType MachineTypeFor(ValueType type) {
+       return MachineType::Int32();
+     case wasm::kWasmI64:
+       return MachineType::Int64();
++    case wasm::kWasmS32:
++      return MachineType::Int32();
++    case wasm::kWasmS64:
++      return MachineType::Int64();
+     case wasm::kWasmF64:
+       return MachineType::Float64();
+     case wasm::kWasmF32:
+diff --git a/src/wasm/baseline/liftoff-compiler.cc b/src/wasm/baseline/liftoff-compiler.cc
+index 4ccf02b64f..1f3aca3ded 100644
+--- a/src/wasm/baseline/liftoff-compiler.cc
++++ b/src/wasm/baseline/liftoff-compiler.cc
+@@ -977,6 +977,10 @@ class LiftoffCompiler {
+               Value* result) {
+     unsupported(decoder, "simd");
+   }
++  void SecretOp(Decoder* decoder, WasmOpcode opcode, Vector<Value> args,
++              Value* result) {
++    unsupported(decoder, "secret");
++  }
+   void SimdLaneOp(Decoder* decoder, WasmOpcode opcode,
+                   const SimdLaneOperand<validate>& operand,
+                   const Vector<Value> inputs, Value* result) {
+diff --git a/src/wasm/function-body-decoder-impl.h b/src/wasm/function-body-decoder-impl.h
+index eb8c7a8355..f9c0f815d0 100644
+--- a/src/wasm/function-body-decoder-impl.h
++++ b/src/wasm/function-body-decoder-impl.h
+@@ -194,10 +194,16 @@ struct BlockTypeOperand {
+         return true;
+       case kLocalI32:
+         *result = kWasmI32;
+-        return true;
++      return true;
+       case kLocalI64:
+         *result = kWasmI64;
+         return true;
++      case kLocalS32:
++        *result = kWasmS32;
++        return true;
++      case kLocalS64:
++        *result = kWasmS64;
++        return true;
+       case kLocalF32:
+         *result = kWasmF32;
+         return true;
+@@ -567,6 +573,8 @@ struct ControlWithNamedConstructors : public ControlBase<Value> {
+     const Value& rhs, Value* result)                                           \
+   F(I32Const, Value* result, int32_t value)                                    \
+   F(I64Const, Value* result, int64_t value)                                    \
++  F(S32Const, Value* result, int32_t value)                                    \
++  F(S64Const, Value* result, int64_t value)                                    \
+   F(F32Const, Value* result, float value)                                      \
+   F(F64Const, Value* result, double value)                                     \
+   F(Drop, const Value& value)                                                  \
+@@ -597,6 +605,7 @@ struct ControlWithNamedConstructors : public ControlBase<Value> {
+     const CallIndirectOperand<validate>& operand, const Value args[],          \
+     Value returns[])                                                           \
+   F(SimdOp, WasmOpcode opcode, Vector<Value> args, Value* result)              \
++  F(SecretOp, WasmOpcode opcode, Vector<Value> args, Value* result)              \
+   F(SimdLaneOp, WasmOpcode opcode, const SimdLaneOperand<validate>& operand,   \
+     const Vector<Value> inputs, Value* result)                                 \
+   F(SimdShiftOp, WasmOpcode opcode, const SimdShiftOperand<validate>& operand, \
+@@ -664,6 +673,12 @@ class WasmDecoder : public Decoder {
+         case kLocalI64:
+           type = kWasmI64;
+           break;
++        case kLocalS32:
++          type = kWasmS32;
++          break;
++        case kLocalS64:
++          type = kWasmS64;
++          break;
+         case kLocalF32:
+           type = kWasmF32;
+           break;
+@@ -1022,6 +1037,24 @@ class WasmDecoder : public Decoder {
+             return 2;
+         }
+       }
++      case kSecretPrefix: {
++        byte secret_index = decoder->read_u8<validate>(pc + 1, "secret_index");
++        WasmOpcode opcode =
++            static_cast<WasmOpcode>(kSecretPrefix << 8 | secret_index);
++        switch (opcode) {
++#define DECLARE_OPCODE_CASE(name, opcode, sig) case kExpr##name:
++          FOREACH_SECRET_OPCODE(DECLARE_OPCODE_CASE)
++#undef DECLARE_OPCODE_CASE
++            return 2;
++          case kExprS32Const: {
++            ImmI32Operand<validate> operand(decoder, pc);
++            return 2 + operand.length;
++          }
++          default:
++            decoder->error(pc, "invalid Secrets opcode");
++            return 2;
++        }
++      }
+       default:
+         return 1;
+     }
+@@ -1055,6 +1088,7 @@ class WasmDecoder : public Decoder {
+       case kExprGetLocal:
+       case kExprGetGlobal:
+       case kExprI32Const:
++      case kExprS32Const:
+       case kExprI64Const:
+       case kExprF32Const:
+       case kExprF64Const:
+@@ -1083,6 +1117,7 @@ class WasmDecoder : public Decoder {
+         return {0, 0};
+       case kNumericPrefix:
+       case kAtomicPrefix:
++      case kSecretPrefix:
+       case kSimdPrefix: {
+         opcode = static_cast<WasmOpcode>(opcode << 8 | *(pc + 1));
+         switch (opcode) {
+@@ -1828,6 +1863,16 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+             len += DecodeAtomicOpcode(opcode);
+             break;
+           }
++          case kSecretPrefix: {
++            len++;
++            byte secret_index =
++                this->template read_u8<validate>(this->pc_ + 1, "secret index");
++            opcode = static_cast<WasmOpcode>(opcode << 8 | secret_index);
++            TRACE_PART(TRACE_INST_FORMAT, startrel(this->pc_),
++                       WasmOpcodes::OpcodeName(opcode));
++            len += DecodeSecretOpcode(opcode);
++            break;
++          }
+           default: {
+             // Deal with special asmjs opcodes.
+             if (this->module_ != nullptr && this->module_->is_asm_js()) {
+@@ -2132,6 +2177,31 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+     return len;
+   }
+ 
++  unsigned DecodeSecretOpcode(WasmOpcode opcode) {
++    unsigned len = 0;
++    switch (opcode) {
++      case kExprI32Const: {
++        ImmI32Operand<validate> operand(this, this->pc_);
++        auto* value = Push(kWasmI32);
++        CALL_INTERFACE_IF_REACHABLE(I32Const, value, operand.value);
++        len = 1 + operand.length;
++        break;
++      }
++      default: {
++        FunctionSig* sig = WasmOpcodes::Signature(opcode);
++        if (!VALIDATE(sig != nullptr)) {
++          this->error("invalid secret opcode");
++          break;
++        }
++        PopArgs(sig);
++        auto* results =
++            sig->return_count() == 0 ? nullptr : Push(GetReturnType(sig));
++        CALL_INTERFACE_IF_REACHABLE(SecretOp, opcode, vec2vec(args_), results);
++      }
++    }
++    return len;
++  }
++
+   unsigned DecodeAtomicOpcode(WasmOpcode opcode) {
+     unsigned len = 0;
+     ValueType ret_type;
+diff --git a/src/wasm/function-body-decoder.cc b/src/wasm/function-body-decoder.cc
+index 08be93cb43..d9a2710854 100644
+--- a/src/wasm/function-body-decoder.cc
++++ b/src/wasm/function-body-decoder.cc
+@@ -223,6 +223,10 @@ class WasmGraphBuildingInterface {
+     result->node = builder_->Int32Constant(value);
+   }
+ 
++  void S32Const(Decoder* decoder, Value* result, int32_t value) {
++    result->node = builder_->Int32Constant(value);
++  }
++
+   void I64Const(Decoder* decoder, Value* result, int64_t value) {
+     result->node = builder_->Int64Constant(value);
+   }
+@@ -385,6 +389,13 @@ class WasmGraphBuildingInterface {
+     if (result) result->node = node;
+   }
+ 
++  void SecretOp(Decoder* decoder, WasmOpcode opcode, Vector<Value> args,
++              Value* result) {
++    TFNode** inputs = GetNodes(args);
++    TFNode* node = BUILD(SecretOp, opcode, inputs);
++    if (result) result->node = node;
++  }
++
+   void SimdLaneOp(Decoder* decoder, WasmOpcode opcode,
+                   const SimdLaneOperand<validate> operand, Vector<Value> inputs,
+                   Value* result) {
+@@ -592,6 +603,10 @@ class WasmGraphBuildingInterface {
+         return builder_->Int32Constant(0);
+       case kWasmI64:
+         return builder_->Int64Constant(0);
++      case kWasmS32:
++        return builder_->Int32Constant(0);
++      case kWasmS64:
++        return builder_->Int64Constant(0);
+       case kWasmF32:
+         return builder_->Float32Constant(0);
+       case kWasmF64:
+diff --git a/src/wasm/module-decoder.cc b/src/wasm/module-decoder.cc
+index 010f191263..5ac6c22dd5 100644
+--- a/src/wasm/module-decoder.cc
++++ b/src/wasm/module-decoder.cc
+@@ -1274,6 +1274,10 @@ class ModuleDecoderImpl : public Decoder {
+         return kWasmI32;
+       case kLocalI64:
+         return kWasmI64;
++      case kLocalS32:
++        return kWasmS32;
++      case kLocalS64:
++        return kWasmS64;
+       case kLocalF32:
+         return kWasmF32;
+       case kLocalF64:
+diff --git a/src/wasm/wasm-constants.h b/src/wasm/wasm-constants.h
+index 5e7ce1e4f5..394ede2914 100644
+--- a/src/wasm/wasm-constants.h
++++ b/src/wasm/wasm-constants.h
+@@ -18,6 +18,8 @@ enum ValueTypeCode : uint8_t {
+   kLocalVoid = 0x40,
+   kLocalI32 = 0x7f,
+   kLocalI64 = 0x7e,
++  kLocalS32 = 0x7a,
++  kLocalS64 = 0x79,
+   kLocalF32 = 0x7d,
+   kLocalF64 = 0x7c,
+   kLocalS128 = 0x7b
+diff --git a/src/wasm/wasm-debug.cc b/src/wasm/wasm-debug.cc
+index 76719a23f4..2db96766af 100644
+--- a/src/wasm/wasm-debug.cc
++++ b/src/wasm/wasm-debug.cc
+@@ -244,12 +244,14 @@ class InterpreterHandle {
+       WasmValue ret_val = thread->GetReturnValue(0);
+ #define CASE_RET_TYPE(type, ctype)                                       \
+   case type:                                                             \
+-    DCHECK_EQ(1 << ElementSizeLog2Of(sig->GetReturn(0)), sizeof(ctype)); \
++    DCHECK_EQ(1 << ElementSizeLog2Of(MachineRepresentation(sig->GetReturn(0))), sizeof(ctype)); \
+     WriteUnalignedValue<ctype>(arg_buffer, ret_val.to<ctype>());         \
+     break;
+       switch (sig->GetReturn(0)) {
+         CASE_RET_TYPE(kWasmI32, uint32_t)
+         CASE_RET_TYPE(kWasmI64, uint64_t)
++        CASE_RET_TYPE(kWasmS32, uint32_t)
++        CASE_RET_TYPE(kWasmS64, uint64_t)
+         CASE_RET_TYPE(kWasmF32, float)
+         CASE_RET_TYPE(kWasmF64, double)
+ #undef CASE_RET_TYPE
+diff --git a/src/wasm/wasm-opcodes.cc b/src/wasm/wasm-opcodes.cc
+index b503aa1a5e..61e6cb1c3b 100644
+--- a/src/wasm/wasm-opcodes.cc
++++ b/src/wasm/wasm-opcodes.cc
+@@ -391,6 +391,14 @@ struct GetSimdOpcodeSigIndex {
+   }
+ };
+ 
++struct GetSecretOpcodeSigIndex {
++  constexpr WasmOpcodeSig operator()(byte opcode) const {
++#define CASE(name, opc, sig) opcode == (opc & 0xFF) ? kSigEnum_##sig:
++    return FOREACH_SECRET_OPCODE(CASE) kSigEnum_None;
++#undef CASE
++  }
++};
++
+ struct GetAtomicOpcodeSigIndex {
+   constexpr WasmOpcodeSig operator()(byte opcode) const {
+ #define CASE(name, opc, sig) opcode == (opc & 0xFF) ? kSigEnum_##sig:
+@@ -413,6 +421,8 @@ constexpr std::array<WasmOpcodeSig, 256> kSimpleAsmjsExprSigTable =
+     base::make_array<256>(GetAsmJsOpcodeSigIndex{});
+ constexpr std::array<WasmOpcodeSig, 256> kSimdExprSigTable =
+     base::make_array<256>(GetSimdOpcodeSigIndex{});
++constexpr std::array<WasmOpcodeSig, 256> kSecretExprSigTable =
++    base::make_array<256>(GetSecretOpcodeSigIndex{});
+ constexpr std::array<WasmOpcodeSig, 256> kAtomicExprSigTable =
+     base::make_array<256>(GetAtomicOpcodeSigIndex{});
+ constexpr std::array<WasmOpcodeSig, 256> kNumericExprSigTable =
+@@ -425,6 +435,9 @@ FunctionSig* WasmOpcodes::Signature(WasmOpcode opcode) {
+     case kSimdPrefix:
+       return const_cast<FunctionSig*>(
+           kSimpleExprSigs[kSimdExprSigTable[opcode & 0xFF]]);
++    case kSecretPrefix:
++      return const_cast<FunctionSig*>(
++          kSimpleExprSigs[kSecretExprSigTable[opcode & 0xFF]]);
+     case kAtomicPrefix:
+       return const_cast<FunctionSig*>(
+           kSimpleExprSigs[kAtomicExprSigTable[opcode & 0xFF]]);
+diff --git a/src/wasm/wasm-opcodes.h b/src/wasm/wasm-opcodes.h
+index 70f1260918..4380c545b6 100644
+--- a/src/wasm/wasm-opcodes.h
++++ b/src/wasm/wasm-opcodes.h
+@@ -19,6 +19,11 @@ namespace wasm {
+ // A typedef improves readability without adding a whole new type system.
+ class ValueType {
+   public:
++    constexpr static ValueType FromRep(MachineRepresentation r) {
++      ValueType t;
++      t.v = static_cast<uint8_t>(r) + static_cast<uint8_t>(MachineRepresentation::kLastRepresentation);
++      return t;
++    }
+     constexpr ValueType() : v(0) {}
+     constexpr ValueType(MachineRepresentation v) : v(static_cast<uint8_t>(v)) {}
+     constexpr explicit operator MachineRepresentation() const {
+@@ -35,6 +40,8 @@ class ValueType {
+ constexpr ValueType kWasmStmt = MachineRepresentation::kNone;
+ constexpr ValueType kWasmI32 = MachineRepresentation::kWord32;
+ constexpr ValueType kWasmI64 = MachineRepresentation::kWord64;
++constexpr ValueType kWasmS32 = ValueType::FromRep(MachineRepresentation::kWord32);
++constexpr ValueType kWasmS64 = ValueType::FromRep(MachineRepresentation::kWord64);
+ constexpr ValueType kWasmF32 = MachineRepresentation::kFloat32;
+ constexpr ValueType kWasmF64 = MachineRepresentation::kFloat64;
+ constexpr ValueType kWasmS128 = MachineRepresentation::kSimd128;
+@@ -78,6 +85,7 @@ using WasmName = Vector<const char>;
+   V(SetGlobal, 0x24, _)        \
+   V(I32Const, 0x41, _)         \
+   V(I64Const, 0x42, _)         \
++  V(S32Const, 0xfb41, _)                  \
+   V(F32Const, 0x43, _)         \
+   V(F64Const, 0x44, _)
+ 
+@@ -407,6 +415,35 @@ using WasmName = Vector<const char>;
+   V(I8x16ShrS, 0xfd63, _)                \
+   V(I8x16ShrU, 0xfd71, _)
+ 
++#define FOREACH_SECRET_OPCODE(V)  \
++  V(S32Eqz, 0xfb45, sec_sec)            \
++  V(S32Eq, 0xfb46, sec_secsec)            \
++  V(S32Ne, 0xfb47, sec_secsec)            \
++  V(S32LtS, 0xfb48, sec_secsec)           \
++  V(S32LtU, 0xfb49, sec_secsec)           \
++  V(S32GtS, 0xfb4a, sec_secsec)           \
++  V(S32GtU, 0xfb4b, sec_secsec)           \
++  V(S32LeS, 0xfb4c, sec_secsec)           \
++  V(S32LeU, 0xfb4d, sec_secsec)           \
++  V(S32GeS, 0xfb4e, sec_secsec)           \
++  V(S32GeU, 0xfb4f, sec_secsec)           \
++  V(S32Clz, 0xfb67, sec_sec)            \
++  V(S32Ctz, 0xfb68, sec_sec)            \
++  V(S32Popcnt, 0xfb69, sec_sec)         \
++  V(S32Add, 0xfb6a, sec_secsec)           \
++  V(S32Sub, 0xfb6b, sec_secsec)           \
++  V(S32Mul, 0xfb6c, sec_secsec)           \
++  V(S32RemS, 0xfb6f, sec_secsec)          \
++  V(S32RemU, 0xfb70, sec_secsec)          \
++  V(S32And, 0xfb71, sec_secsec)           \
++  V(S32Ior, 0xfb72, sec_secsec)           \
++  V(S32Xor, 0xfb73, sec_secsec)           \
++  V(S32Shl, 0xfb74, sec_secsec)           \
++  V(S32ShrS, 0xfb75, sec_secsec)          \
++  V(S32ShrU, 0xfb76, sec_secsec)          \
++  V(S32Rol, 0xfb77, sec_secsec)           \
++  V(S32Ror, 0xfb78, sec_secsec)
++
+ #define FOREACH_SIMD_MASK_OPERAND_OPCODE(V) V(S8x16Shuffle, 0xfd6b, s_ss)
+ 
+ #define FOREACH_SIMD_MEM_OPCODE(V) \
+@@ -458,6 +495,7 @@ using WasmName = Vector<const char>;
+   FOREACH_LOAD_MEM_OPCODE(V)          \
+   FOREACH_MISC_MEM_OPCODE(V)          \
+   FOREACH_ASMJS_COMPAT_OPCODE(V)      \
++  FOREACH_SECRET_OPCODE(V)    \
+   FOREACH_SIMD_0_OPERAND_OPCODE(V)    \
+   FOREACH_SIMD_1_OPERAND_OPCODE(V)    \
+   FOREACH_SIMD_MASK_OPERAND_OPCODE(V) \
+@@ -467,6 +505,7 @@ using WasmName = Vector<const char>;
+ 
+ // All signatures.
+ #define FOREACH_SIGNATURE(V)             \
++  FOREACH_SECRET_SIGNATURE(V)            \
+   FOREACH_SIMD_SIGNATURE(V)              \
+   V(i_ii, kWasmI32, kWasmI32, kWasmI32)  \
+   V(i_i, kWasmI32, kWasmI32)             \
+@@ -500,6 +539,11 @@ using WasmName = Vector<const char>;
+   V(v_il, kWasmI64, kWasmI32, kWasmI64)  \
+   V(i_iii, kWasmI32, kWasmI32, kWasmI32, kWasmI32)
+ 
++#define FOREACH_SECRET_SIGNATURE(V)         \
++  V(sec_sec, kWasmS32, kWasmS32)            \
++  V(i_sec, kWasmI32, kWasmS32)              \
++  V(sec_secsec, kWasmS32, kWasmS32, kWasmS32)
++
+ #define FOREACH_SIMD_SIGNATURE(V)          \
+   V(s_s, kWasmS128, kWasmS128)             \
+   V(s_f, kWasmS128, kWasmF32)              \
+@@ -510,6 +554,7 @@ using WasmName = Vector<const char>;
+   V(s_sss, kWasmS128, kWasmS128, kWasmS128, kWasmS128)
+ 
+ #define FOREACH_PREFIX(V) \
++  V(Secret, 0xfb)         \
+   V(Numeric, 0xfc)        \
+   V(Simd, 0xfd)           \
+   V(Atomic, 0xfe)
+@@ -680,6 +725,10 @@ class V8_EXPORT_PRIVATE WasmOpcodes {
+         return kLocalI32;
+       case kWasmI64:
+         return kLocalI64;
++      case kWasmS32:
++        return kLocalS32;
++      case kWasmS64:
++        return kLocalS64;
+       case kWasmF32:
+         return kLocalF32;
+       case kWasmF64:
+@@ -699,6 +748,10 @@ class V8_EXPORT_PRIVATE WasmOpcodes {
+         return MachineType::Int32();
+       case kWasmI64:
+         return MachineType::Int64();
++      case kWasmS32:
++        return MachineType::Int32();
++      case kWasmS64:
++        return MachineType::Int64();
+       case kWasmF32:
+         return MachineType::Float32();
+       case kWasmF64:
+@@ -758,6 +811,10 @@ class V8_EXPORT_PRIVATE WasmOpcodes {
+         return "i32";
+       case kWasmI64:
+         return "i64";
++      case kWasmS32:
++        return "s32";
++      case kWasmS64:
++        return "s64";
+       case kWasmF32:
+         return "f32";
+       case kWasmF64:
+@@ -781,6 +838,8 @@ struct WasmInitExpr {
+     kGlobalIndex,
+     kI32Const,
+     kI64Const,
++    kS32Const,
++    kS64Const,
+     kF32Const,
+     kF64Const
+   } kind;
+@@ -794,7 +853,8 @@ struct WasmInitExpr {
+   } val;
+ 
+   WasmInitExpr() : kind(kNone) {}
+-  explicit WasmInitExpr(int32_t v) : kind(kI32Const) { val.i32_const = v; }
++  explicit WasmInitExpr(int64_t v, bool sec=false) : kind(sec ? kS64Const : kI64Const) { val.i64_const = v; }
++  explicit WasmInitExpr(int32_t v, bool sec=false) : kind(sec ? kS32Const : kI32Const) { val.i32_const = v; }
+   explicit WasmInitExpr(int64_t v) : kind(kI64Const) { val.i64_const = v; }
+   explicit WasmInitExpr(float v) : kind(kF32Const) { val.f32_const = v; }
+   explicit WasmInitExpr(double v) : kind(kF64Const) { val.f64_const = v; }
+-- 
+2.15.0
+
+
+From 0f72e71dcb629072c0ac80ee204d8c36ae2ba9c2 Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Mon, 16 Apr 2018 13:28:35 -0700
+Subject: [PATCH 03/15] S64 support
+
+---
+ src/compiler/wasm-compiler.cc         |  96 +++++++++++++++++++++++-
+ src/compiler/wasm-linkage.cc          |   2 +-
+ src/wasm/baseline/liftoff-compiler.cc |   8 ++
+ src/wasm/function-body-decoder-impl.h |  13 +++-
+ src/wasm/function-body-decoder.cc     |   4 +
+ src/wasm/wasm-opcodes.cc              |   2 +-
+ src/wasm/wasm-opcodes.h               | 101 ++++++++++++++++++--------
+ 7 files changed, 186 insertions(+), 40 deletions(-)
+
+diff --git a/src/compiler/wasm-compiler.cc b/src/compiler/wasm-compiler.cc
+index b18917e618..58e7606c67 100644
+--- a/src/compiler/wasm-compiler.cc
++++ b/src/compiler/wasm-compiler.cc
+@@ -1342,7 +1342,7 @@ Node* WasmGraphBuilder::BuildChangeEndiannessLoad(Node* node,
+       // Perform sign extension using following trick
+       // result = (x << machine_width - type_width) >> (machine_width -
+       // type_width)
+-      if (wasmtype == wasm::kWasmI64) {
++      if (wasmtype == wasm::kWasmI64 || wasmtype == wasm::kWasmS64) {
+         shiftBitCount = jsgraph()->Int32Constant(64 - valueSizeInBits);
+         result = graph()->NewNode(
+             m->Word64Sar(),
+@@ -3167,7 +3167,7 @@ bool WasmGraphBuilder::BuildWasmToJSWrapper(
+ namespace {
+ bool HasInt64ParamOrReturn(wasm::FunctionSig* sig) {
+   for (auto type : sig->all()) {
+-    if (type == wasm::kWasmI64) return true;
++    if (type == wasm::kWasmI64 || type == wasm::kWasmS64) return true;
+   }
+   return false;
+ }
+@@ -3803,7 +3803,7 @@ Node* WasmGraphBuilder::LoadMem(wasm::ValueType type, MachineType memtype,
+   load = BuildChangeEndiannessLoad(load, memtype, type);
+ #endif
+ 
+-  if (type == wasm::kWasmI64 &&
++  if ((type == wasm::kWasmI64 || type == wasm::kWasmS64) &&
+       ElementSizeLog2Of(memtype.representation()) < 3) {
+     // TODO(titzer): TF zeroes the upper bits of 64-bit loads for subword sizes.
+     if (memtype.IsSigned()) {
+@@ -4088,6 +4088,96 @@ Node* WasmGraphBuilder::SecretOp(wasm::WasmOpcode opcode, Node* const* inputs) {
+       return graph()->NewNode(m->Uint32LessThan(), inputs[1], inputs[0]);
+     case wasm::kExprS32GeU:
+       return graph()->NewNode(m->Uint32LessThanOrEqual(), inputs[1], inputs[0]);
++
++    // S64 Unops
++    case wasm::kExprS32ConvertS64:
++      return graph()->NewNode(m->TruncateInt64ToInt32(), inputs[0]);
++    case wasm::kExprS64SConvertS32:
++      return graph()->NewNode(m->ChangeInt32ToInt64(), inputs[0]);
++    case wasm::kExprS64UConvertS32:
++      return graph()->NewNode(m->ChangeUint32ToUint64(), inputs[0]);
++    case wasm::kExprS64Clz:
++      return graph()->NewNode(m->Word64Clz(), inputs[0]);
++    case wasm::kExprS64Ctz: {
++      OptionalOperator ctz64 = m->Word64Ctz();
++      if (ctz64.IsSupported()) {
++        return graph()->NewNode(ctz64.op(), inputs[0]);
++        break;
++      } else if (m->Is32() && m->Word32Ctz().IsSupported()) {
++        return graph()->NewNode(ctz64.placeholder(), inputs[0]);
++      } else if (m->Word64ReverseBits().IsSupported()) {
++        Node* reversed = graph()->NewNode(m->Word64ReverseBits().op(), inputs[0]);
++        Node* result = graph()->NewNode(m->Word64Clz(), reversed);
++        return result;
++      } else {
++        return BuildI64Ctz(inputs[0]);
++      }
++    }
++    case wasm::kExprS64Popcnt: {
++      OptionalOperator popcnt64 = m->Word64Popcnt();
++      if (popcnt64.IsSupported()) {
++        return graph()->NewNode(popcnt64.op(), inputs[0]);
++      } else if (m->Is32() && m->Word32Popcnt().IsSupported()) {
++        return graph()->NewNode(popcnt64.placeholder(), inputs[0]);
++      } else {
++        return BuildI64Popcnt(inputs[0]);
++      }
++      break;
++    }
++
++    // S64 Binops
++    case wasm::kExprS64And:
++      return graph()->NewNode(m->Word64And(), inputs[0], inputs[1]);
++    case wasm::kExprS64Add:
++      return graph()->NewNode(m->Int64Add(), inputs[0], inputs[1]);
++    case wasm::kExprS64Sub:
++      return graph()->NewNode(m->Int64Sub(), inputs[0], inputs[1]);
++    case wasm::kExprS64Mul:
++      return graph()->NewNode(m->Int64Mul(), inputs[0], inputs[1]);
++    case wasm::kExprS64Ior:
++      return graph()->NewNode(m->Word64Or(), inputs[0], inputs[1]);
++    case wasm::kExprS64Xor:
++      return graph()->NewNode(m->Word64Xor(), inputs[0], inputs[1]);
++    case wasm::kExprS64Shl:
++      return graph()->NewNode(m->Word64Shl(), inputs[0], MaskShiftCount64(inputs[1]));
++      break;
++    case wasm::kExprS64ShrU:
++      return graph()->NewNode(m->Word64Shr(), inputs[0], MaskShiftCount64(inputs[1]));
++      break;
++    case wasm::kExprS64ShrS:
++      return graph()->NewNode(m->Word64Sar(), inputs[0], MaskShiftCount64(inputs[1]));
++      break;
++    case wasm::kExprS64Eq:
++      return graph()->NewNode(m->Word64Equal(), inputs[0], inputs[1]);
++    case wasm::kExprS64Ne:
++      return Invert(SecretOp(wasm::kExprS64Eq, inputs));
++    case wasm::kExprS64LtS:
++      return graph()->NewNode(m->Int64LessThan(), inputs[0], inputs[1]);
++    case wasm::kExprS64LeS:
++      return graph()->NewNode(m->Int64LessThanOrEqual(), inputs[0], inputs[1]);
++    case wasm::kExprS64LtU:
++      return graph()->NewNode(m->Uint64LessThan(), inputs[0], inputs[1]);
++    case wasm::kExprS64LeU:
++      return graph()->NewNode(m->Uint64LessThanOrEqual(), inputs[0], inputs[1]);
++    case wasm::kExprS64GtS:
++      return graph()->NewNode(m->Int64LessThan(), inputs[1], inputs[0]);
++      break;
++    case wasm::kExprS64GeS:
++      return graph()->NewNode(m->Int64LessThanOrEqual(), inputs[1], inputs[0]);
++      break;
++    case wasm::kExprS64GtU:
++      return graph()->NewNode(m->Uint64LessThan(), inputs[1], inputs[0]);
++      break;
++    case wasm::kExprS64GeU:
++      return graph()->NewNode(m->Uint64LessThanOrEqual(), inputs[1], inputs[0]);
++      break;
++    case wasm::kExprS64Ror:
++      return graph()->NewNode(m->Word64Ror(), inputs[0], MaskShiftCount64(inputs[1]));
++      break;
++    case wasm::kExprS64Rol:
++      return BuildI64Rol(inputs[0], inputs[1]);
++    case wasm::kExprS64Eqz:
++      return graph()->NewNode(m->Word64Equal(), inputs[0], jsgraph()->Int64Constant(0));
+     default:
+       FATAL_UNSUPPORTED_OPCODE(opcode);
+   }
+diff --git a/src/compiler/wasm-linkage.cc b/src/compiler/wasm-linkage.cc
+index c8c6a99775..ffc67566bb 100644
+--- a/src/compiler/wasm-linkage.cc
++++ b/src/compiler/wasm-linkage.cc
+@@ -204,7 +204,7 @@ struct Allocator {
+   }
+   int Words(ValueType type) {
+     if (kPointerSize < 8 &&
+-        (type == wasm::kWasmI64 || type == wasm::kWasmF64)) {
++        (type == wasm::kWasmI64 || type ==wasm::kWasmS64 || type == wasm::kWasmF64)) {
+       return 2;
+     }
+     return 1;
+diff --git a/src/wasm/baseline/liftoff-compiler.cc b/src/wasm/baseline/liftoff-compiler.cc
+index 1f3aca3ded..41e2ee2480 100644
+--- a/src/wasm/baseline/liftoff-compiler.cc
++++ b/src/wasm/baseline/liftoff-compiler.cc
+@@ -576,6 +576,14 @@ class LiftoffCompiler {
+     unsupported(decoder, "i64.const");
+   }
+ 
++  void S32Const(Decoder* decoder, Value* result, int32_t value) {
++    unsupported(decoder, "f64.const");
++  }
++
++  void S64Const(Decoder* decoder, Value* result, int32_t value) {
++    unsupported(decoder, "f64.const");
++  }
++
+   void F32Const(Decoder* decoder, Value* result, float value) {
+     LiftoffRegister reg = __ GetUnusedRegister(kFpReg);
+     __ LoadConstant(reg, WasmValue(value));
+diff --git a/src/wasm/function-body-decoder-impl.h b/src/wasm/function-body-decoder-impl.h
+index f9c0f815d0..aaf6477ee7 100644
+--- a/src/wasm/function-body-decoder-impl.h
++++ b/src/wasm/function-body-decoder-impl.h
+@@ -2180,10 +2180,17 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+   unsigned DecodeSecretOpcode(WasmOpcode opcode) {
+     unsigned len = 0;
+     switch (opcode) {
+-      case kExprI32Const: {
++      case kExprS32Const: {
+         ImmI32Operand<validate> operand(this, this->pc_);
+-        auto* value = Push(kWasmI32);
+-        CALL_INTERFACE_IF_REACHABLE(I32Const, value, operand.value);
++        auto* value = Push(kWasmS32);
++        CALL_INTERFACE_IF_REACHABLE(S32Const, value, operand.value);
++        len = 1 + operand.length;
++        break;
++      }
++      case kExprS64Const: {
++        ImmI64Operand<validate> operand(this, this->pc_);
++        auto* value = Push(kWasmS64);
++        CALL_INTERFACE_IF_REACHABLE(S64Const, value, operand.value);
+         len = 1 + operand.length;
+         break;
+       }
+diff --git a/src/wasm/function-body-decoder.cc b/src/wasm/function-body-decoder.cc
+index d9a2710854..143da465e8 100644
+--- a/src/wasm/function-body-decoder.cc
++++ b/src/wasm/function-body-decoder.cc
+@@ -227,6 +227,10 @@ class WasmGraphBuildingInterface {
+     result->node = builder_->Int32Constant(value);
+   }
+ 
++  void S64Const(Decoder* decoder, Value* result, int32_t value) {
++    result->node = builder_->Int64Constant(value);
++  }
++
+   void I64Const(Decoder* decoder, Value* result, int64_t value) {
+     result->node = builder_->Int64Constant(value);
+   }
+diff --git a/src/wasm/wasm-opcodes.cc b/src/wasm/wasm-opcodes.cc
+index 61e6cb1c3b..9f06f8ed7d 100644
+--- a/src/wasm/wasm-opcodes.cc
++++ b/src/wasm/wasm-opcodes.cc
+@@ -335,7 +335,7 @@ std::ostream& operator<<(std::ostream& os, const FunctionSig& sig) {
+ 
+ bool IsJSCompatibleSignature(const FunctionSig* sig) {
+   for (auto type : sig->all()) {
+-    if (type == wasm::kWasmI64 || type == wasm::kWasmS128) return false;
++    if (type == wasm::kWasmI64 || type == wasm::kWasmS64 || type == wasm::kWasmS128) return false;
+   }
+   return sig->return_count() <= 1;
+ }
+diff --git a/src/wasm/wasm-opcodes.h b/src/wasm/wasm-opcodes.h
+index 4380c545b6..bafeb069e2 100644
+--- a/src/wasm/wasm-opcodes.h
++++ b/src/wasm/wasm-opcodes.h
+@@ -86,6 +86,7 @@ using WasmName = Vector<const char>;
+   V(I32Const, 0x41, _)         \
+   V(I64Const, 0x42, _)         \
+   V(S32Const, 0xfb41, _)                  \
++  V(S64Const, 0xfb42, _)                  \
+   V(F32Const, 0x43, _)         \
+   V(F64Const, 0x44, _)
+ 
+@@ -415,34 +416,64 @@ using WasmName = Vector<const char>;
+   V(I8x16ShrS, 0xfd63, _)                \
+   V(I8x16ShrU, 0xfd71, _)
+ 
+-#define FOREACH_SECRET_OPCODE(V)  \
+-  V(S32Eqz, 0xfb45, sec_sec)            \
+-  V(S32Eq, 0xfb46, sec_secsec)            \
+-  V(S32Ne, 0xfb47, sec_secsec)            \
+-  V(S32LtS, 0xfb48, sec_secsec)           \
+-  V(S32LtU, 0xfb49, sec_secsec)           \
+-  V(S32GtS, 0xfb4a, sec_secsec)           \
+-  V(S32GtU, 0xfb4b, sec_secsec)           \
+-  V(S32LeS, 0xfb4c, sec_secsec)           \
+-  V(S32LeU, 0xfb4d, sec_secsec)           \
+-  V(S32GeS, 0xfb4e, sec_secsec)           \
+-  V(S32GeU, 0xfb4f, sec_secsec)           \
+-  V(S32Clz, 0xfb67, sec_sec)            \
+-  V(S32Ctz, 0xfb68, sec_sec)            \
+-  V(S32Popcnt, 0xfb69, sec_sec)         \
+-  V(S32Add, 0xfb6a, sec_secsec)           \
+-  V(S32Sub, 0xfb6b, sec_secsec)           \
+-  V(S32Mul, 0xfb6c, sec_secsec)           \
+-  V(S32RemS, 0xfb6f, sec_secsec)          \
+-  V(S32RemU, 0xfb70, sec_secsec)          \
+-  V(S32And, 0xfb71, sec_secsec)           \
+-  V(S32Ior, 0xfb72, sec_secsec)           \
+-  V(S32Xor, 0xfb73, sec_secsec)           \
+-  V(S32Shl, 0xfb74, sec_secsec)           \
+-  V(S32ShrS, 0xfb75, sec_secsec)          \
+-  V(S32ShrU, 0xfb76, sec_secsec)          \
+-  V(S32Rol, 0xfb77, sec_secsec)           \
+-  V(S32Ror, 0xfb78, sec_secsec)
++#define FOREACH_SECRET_OPCODE(V)      \
++  V(S32Eqz, 0xfb45, sec_sec)          \
++  V(S32Eq, 0xfb46, sec_secsec)        \
++  V(S32Ne, 0xfb47, sec_secsec)        \
++  V(S32LtS, 0xfb48, sec_secsec)       \
++  V(S32LtU, 0xfb49, sec_secsec)       \
++  V(S32GtS, 0xfb4a, sec_secsec)       \
++  V(S32GtU, 0xfb4b, sec_secsec)       \
++  V(S32LeS, 0xfb4c, sec_secsec)       \
++  V(S32LeU, 0xfb4d, sec_secsec)       \
++  V(S32GeS, 0xfb4e, sec_secsec)       \
++  V(S32GeU, 0xfb4f, sec_secsec)       \
++  V(S32Clz, 0xfb67, sec_sec)          \
++  V(S32Ctz, 0xfb68, sec_sec)          \
++  V(S32Popcnt, 0xfb69, sec_sec)       \
++  V(S32Add, 0xfb6a, sec_secsec)       \
++  V(S32Sub, 0xfb6b, sec_secsec)       \
++  V(S32Mul, 0xfb6c, sec_secsec)       \
++  V(S32RemS, 0xfb6f, sec_secsec)      \
++  V(S32RemU, 0xfb70, sec_secsec)      \
++  V(S32And, 0xfb71, sec_secsec)       \
++  V(S32Ior, 0xfb72, sec_secsec)       \
++  V(S32Xor, 0xfb73, sec_secsec)       \
++  V(S32Shl, 0xfb74, sec_secsec)       \
++  V(S32ShrS, 0xfb75, sec_secsec)      \
++  V(S32ShrU, 0xfb76, sec_secsec)      \
++  V(S32Rol, 0xfb77, sec_secsec)       \
++  V(S32Ror, 0xfb78, sec_secsec)       \
++  V(S64Eqz, 0xfb50, sec_lsec)         \
++  V(S64Eq, 0xfb51, sec_lseclsec)      \
++  V(S64Ne, 0xfb52, sec_lseclsec)      \
++  V(S64LtS, 0xfb53, sec_lseclsec)     \
++  V(S64LtU, 0xfb54, sec_lseclsec)     \
++  V(S64GtS, 0xfb55, sec_lseclsec)     \
++  V(S64GtU, 0xfb56, sec_lseclsec)     \
++  V(S64LeS, 0xfb57, sec_lseclsec)     \
++  V(S64LeU, 0xfb58, sec_lseclsec)     \
++  V(S64GeS, 0xfb59, sec_lseclsec)     \
++  V(S64GeU, 0xfb5a, sec_lseclsec)     \
++  V(S64Clz, 0xfb79, lsec_lsec)        \
++  V(S64Ctz, 0xfb7a, lsec_lsec)        \
++  V(S64Popcnt, 0xfb7b, lsec_lsec)     \
++  V(S64Add, 0xfb7c, lsec_lseclsec)    \
++  V(S64Sub, 0xfb7d, lsec_lseclsec)    \
++  V(S64Mul, 0xfb7e, lsec_lseclsec)    \
++  V(S64And, 0xfb83, lsec_lseclsec)    \
++  V(S64Ior, 0xfb84, lsec_lseclsec)    \
++  V(S64Xor, 0xfb85, lsec_lseclsec)    \
++  V(S64Shl, 0xfb86, lsec_lseclsec)    \
++  V(S64ShrS, 0xfb87, lsec_lseclsec)    \
++  V(S64ShrU, 0xfb88, lsec_lseclsec)    \
++  V(S64Rol, 0xfb89, lsec_lseclsec)    \
++  V(S64Ror, 0xfb8a, lsec_lseclsec)    \
++  V(S32ConvertS64, 0xfba7, sec_lsec)     \
++  V(S64SConvertS32, 0xfbac, lsec_sec) \
++  V(S64UConvertS32, 0xfbad, lsec_sec) \
++  V(S32ClassifyI32, 0xfbc0, sec_i)    \
++  V(S64ClassifyI64, 0xfbc1, lsec_l)
+ 
+ #define FOREACH_SIMD_MASK_OPERAND_OPCODE(V) V(S8x16Shuffle, 0xfd6b, s_ss)
+ 
+@@ -539,10 +570,16 @@ using WasmName = Vector<const char>;
+   V(v_il, kWasmI64, kWasmI32, kWasmI64)  \
+   V(i_iii, kWasmI32, kWasmI32, kWasmI32, kWasmI32)
+ 
+-#define FOREACH_SECRET_SIGNATURE(V)         \
+-  V(sec_sec, kWasmS32, kWasmS32)            \
+-  V(i_sec, kWasmI32, kWasmS32)              \
+-  V(sec_secsec, kWasmS32, kWasmS32, kWasmS32)
++#define FOREACH_SECRET_SIGNATURE(V)           \
++  V(sec_sec, kWasmS32, kWasmS32)              \
++  V(sec_i, kWasmS32, kWasmI32)                \
++  V(sec_secsec, kWasmS32, kWasmS32, kWasmS32) \
++  V(sec_lsec, kWasmS32, kWasmS64)             \
++  V(lsec_sec, kWasmS64, kWasmS32)             \
++  V(lsec_l, kWasmS64, kWasmI64)               \
++  V(lsec_lsec, kWasmS64, kWasmS64)            \
++  V(lsec_lseclsec, kWasmS64, kWasmS64, kWasmS64) \
++  V(sec_lseclsec, kWasmS32, kWasmS64, kWasmS64)\
+ 
+ #define FOREACH_SIMD_SIGNATURE(V)          \
+   V(s_s, kWasmS128, kWasmS128)             \
+-- 
+2.15.0
+
+
+From 0ed09cfb8c1da139c62d61f00c9f31ccbc3bb07a Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Fri, 20 Apr 2018 21:02:16 -0700
+Subject: [PATCH 04/15] Secret memory is working so far
+
+---
+ src/wasm/function-body-decoder-impl.h | 94 +++++++++++++++++++++++++--
+ src/wasm/module-compiler.cc           |  9 ++-
+ src/wasm/module-decoder.cc            | 14 ++--
+ src/wasm/wasm-module.h                |  1 +
+ src/wasm/wasm-objects-inl.h           |  2 +
+ src/wasm/wasm-objects.cc              |  5 +-
+ src/wasm/wasm-objects.h               | 11 +++-
+ src/wasm/wasm-opcodes.h               | 81 ++++++++++++++++++++++-
+ 8 files changed, 198 insertions(+), 19 deletions(-)
+
+diff --git a/src/wasm/function-body-decoder-impl.h b/src/wasm/function-body-decoder-impl.h
+index aaf6477ee7..bae0d53d40 100644
+--- a/src/wasm/function-body-decoder-impl.h
++++ b/src/wasm/function-body-decoder-impl.h
+@@ -1046,10 +1046,21 @@ class WasmDecoder : public Decoder {
+           FOREACH_SECRET_OPCODE(DECLARE_OPCODE_CASE)
+ #undef DECLARE_OPCODE_CASE
+             return 2;
+-          case kExprS32Const: {
+-            ImmI32Operand<validate> operand(decoder, pc);
++#define DECLARE_OPCODE_CASE(name, opcode, sig) case kExpr##name:
++          FOREACH_SECRET_MEM_OPCODE(DECLARE_OPCODE_CASE)
++#undef DECLARE_OPCODE_CASE
++          {
++            MemoryAccessOperand<validate> operand(decoder, pc + 1, UINT32_MAX);
+             return 2 + operand.length;
+           }
++          case kExprS32Const: {
++            ImmI32Operand<validate> operand(decoder, pc + 1);
++            return 1 + operand.length;
++          }
++          case kExprS64Const: {
++            ImmI64Operand<validate> operand(decoder, pc + 1);
++            return 1 + operand.length;
++          }
+           default:
+             decoder->error(pc, "invalid Secrets opcode");
+             return 2;
+@@ -1089,6 +1100,7 @@ class WasmDecoder : public Decoder {
+       case kExprGetGlobal:
+       case kExprI32Const:
+       case kExprS32Const:
++      case kExprS64Const:
+       case kExprI64Const:
+       case kExprF32Const:
+       case kExprF64Const:
+@@ -1125,7 +1137,10 @@ class WasmDecoder : public Decoder {
+           case kExprI32AtomicStore8U:
+           case kExprI32AtomicStore16U:
+           case kExprS128StoreMem:
++          FOREACH_SECRET_STORE_OPCODE(DECLARE_OPCODE_CASE)
+             return {2, 0};
++          FOREACH_SECRET_LOAD_OPCODE(DECLARE_OPCODE_CASE)
++            return {1, 1};
+           default: {
+             sig = WasmOpcodes::Signature(opcode);
+             if (sig) {
+@@ -1313,6 +1328,14 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+     return true;
+   }
+ 
++  bool CheckHasSecretMemory() {
++    if (!VALIDATE(this->module_->has_memory)) {
++      this->error(this->pc_ - 1, "memory instruction with no memory");
++      return false;
++    }
++    return true;
++  }
++
+   bool CheckHasSharedMemory() {
+     if (!VALIDATE(this->module_->has_shared_memory)) {
+       this->error(this->pc_ - 1, "Atomic opcodes used without shared memory");
+@@ -2053,6 +2076,7 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+ 
+   int DecodeLoadMem(LoadType type, int prefix_len = 0) {
+     if (!CheckHasMemory()) return 0;
++    if (type.secret() && !CheckHasSecretMemory()) return 0;
+     MemoryAccessOperand<validate> operand(this, this->pc_ + prefix_len,
+                                           type.size_log_2());
+     auto index = Pop(0, kWasmI32);
+@@ -2063,6 +2087,7 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+ 
+   int DecodeStoreMem(StoreType store, int prefix_len = 0) {
+     if (!CheckHasMemory()) return 0;
++    if (store.secret() && !CheckHasSecretMemory()) return 0;
+     MemoryAccessOperand<validate> operand(this, this->pc_ + prefix_len,
+                                           store.size_log_2());
+     auto value = Pop(1, store.value_type());
+@@ -2181,19 +2206,76 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+     unsigned len = 0;
+     switch (opcode) {
+       case kExprS32Const: {
+-        ImmI32Operand<validate> operand(this, this->pc_);
++        ImmI32Operand<validate> operand(this, this->pc_ + 1);
+         auto* value = Push(kWasmS32);
+         CALL_INTERFACE_IF_REACHABLE(S32Const, value, operand.value);
+-        len = 1 + operand.length;
++        len = operand.length;
+         break;
+       }
+       case kExprS64Const: {
+-        ImmI64Operand<validate> operand(this, this->pc_);
++        ImmI64Operand<validate> operand(this, this->pc_ + 1);
+         auto* value = Push(kWasmS64);
+         CALL_INTERFACE_IF_REACHABLE(S64Const, value, operand.value);
+-        len = 1 + operand.length;
++        len = operand.length;
+         break;
+       }
++      case kExprS32LoadMem8S:
++        len = DecodeLoadMem(LoadType::kS32Load8S, 1);
++        break;
++      case kExprS32LoadMem8U:
++        len = DecodeLoadMem(LoadType::kS32Load8U, 1);
++        break;
++      case kExprS32LoadMem16S:
++        len = DecodeLoadMem(LoadType::kS32Load16S, 1);
++        break;
++      case kExprS32LoadMem16U:
++        len = DecodeLoadMem(LoadType::kS32Load16U, 1);
++        break;
++      case kExprS32LoadMem:
++        len = DecodeLoadMem(LoadType::kS32Load, 1);
++        break;
++      case kExprS64LoadMem8S:
++        len = DecodeLoadMem(LoadType::kS64Load8S, 1);
++        break;
++      case kExprS64LoadMem8U:
++        len = DecodeLoadMem(LoadType::kS64Load8U, 1);
++        break;
++      case kExprS64LoadMem16S:
++        len = DecodeLoadMem(LoadType::kS64Load16S, 1);
++        break;
++      case kExprS64LoadMem16U:
++        len = DecodeLoadMem(LoadType::kS64Load16U, 1);
++        break;
++      case kExprS64LoadMem32S:
++        len = DecodeLoadMem(LoadType::kS64Load32S, 1);
++        break;
++      case kExprS64LoadMem32U:
++        len = DecodeLoadMem(LoadType::kS64Load32U, 1);
++        break;
++      case kExprS64LoadMem:
++        len = DecodeLoadMem(LoadType::kS64Load, 1);
++        break;
++      case kExprS32StoreMem8:
++        len = DecodeStoreMem(StoreType::kS32Store8, 1);
++        break;
++      case kExprS32StoreMem16:
++        len = DecodeStoreMem(StoreType::kS32Store16, 1);
++        break;
++      case kExprS32StoreMem:
++        len = DecodeStoreMem(StoreType::kS32Store, 1);
++        break;
++      case kExprS64StoreMem8:
++        len = DecodeStoreMem(StoreType::kS64Store8, 1);
++        break;
++      case kExprS64StoreMem16:
++        len = DecodeStoreMem(StoreType::kS64Store16, 1);
++        break;
++      case kExprS64StoreMem32:
++        len = DecodeStoreMem(StoreType::kS64Store32, 1);
++        break;
++      case kExprS64StoreMem:
++        len = DecodeStoreMem(StoreType::kS64Store, 1);
++        break;
+       default: {
+         FunctionSig* sig = WasmOpcodes::Signature(opcode);
+         if (!VALIDATE(sig != nullptr)) {
+diff --git a/src/wasm/module-compiler.cc b/src/wasm/module-compiler.cc
+index 4a2e610b99..cf5ff92c38 100644
+--- a/src/wasm/module-compiler.cc
++++ b/src/wasm/module-compiler.cc
+@@ -2444,7 +2444,7 @@ MaybeHandle<WasmInstanceObject> InstanceBuilder::Build() {
+       // No memory object exists. Create one.
+       Handle<WasmMemoryObject> memory_object = WasmMemoryObject::New(
+           isolate_, memory_,
+-          module_->maximum_pages != 0 ? module_->maximum_pages : -1);
++          module_->maximum_pages != 0 ? module_->maximum_pages : -1, module_->has_secret_memory);
+       instance->set_memory_object(*memory_object);
+     }
+ 
+@@ -3039,6 +3039,13 @@ int InstanceBuilder::ProcessImports(Handle<FixedArray> code_table,
+             return -1;
+           }
+         }
++        if (module_->has_secret_memory != memory->is_secret()) {
++          thrower_->LinkError(
++              "mismatch in secret state of memory, declared = %d, imported = "
++              "%d",
++              module_->has_secret_memory, memory->is_secret());
++          return -1;
++        }
+         if (module_->has_shared_memory != buffer->is_shared()) {
+           thrower_->LinkError(
+               "mismatch in shared state of memory, declared = %d, imported = "
+diff --git a/src/wasm/module-decoder.cc b/src/wasm/module-decoder.cc
+index 5ac6c22dd5..87417b0de6 100644
+--- a/src/wasm/module-decoder.cc
++++ b/src/wasm/module-decoder.cc
+@@ -498,7 +498,7 @@ class ModuleDecoderImpl : public Decoder {
+               "memory", "pages", FLAG_wasm_max_mem_pages,
+               &module_->initial_pages, &module_->has_maximum_pages,
+               kSpecMaxWasmMemoryPages, &module_->maximum_pages,
+-              &module_->has_shared_memory);
++              &module_->has_shared_memory, &module_->has_secret_memory);
+           break;
+         }
+         case kExternalGlobal: {
+@@ -566,7 +566,7 @@ class ModuleDecoderImpl : public Decoder {
+       consume_resizable_limits(
+           "memory", "pages", FLAG_wasm_max_mem_pages, &module_->initial_pages,
+           &module_->has_maximum_pages, kSpecMaxWasmMemoryPages,
+-          &module_->maximum_pages, &module_->has_shared_memory);
++          &module_->maximum_pages, &module_->has_shared_memory, &module_->has_secret_memory);
+     }
+   }
+ 
+@@ -1124,7 +1124,8 @@ class ModuleDecoderImpl : public Decoder {
+                                 uint32_t max_initial, uint32_t* initial,
+                                 bool* has_max, uint32_t max_maximum,
+                                 uint32_t* maximum,
+-                                bool* has_shared_memory = nullptr) {
++                                bool* has_shared_memory = nullptr,
++                                bool* has_secret_memory = nullptr) {
+     uint8_t flags = consume_u8("resizable limits flags");
+     const byte* pos = pc();
+ 
+@@ -1142,11 +1143,14 @@ class ModuleDecoderImpl : public Decoder {
+                name);
+       }
+     } else {
+-      if (flags & 0xFE) {
++      if (flags & 0xFC) {
+         errorf(pos - 1, "invalid %s limits flags", name);
+       }
+     }
+-
++    if(flags & 0x2) {
++      DCHECK_NOT_NULL(has_shared_memory);
++      *has_secret_memory = true;
++    }
+     *initial = consume_u32v("initial size");
+     *has_max = false;
+     if (*initial > max_initial) {
+diff --git a/src/wasm/wasm-module.h b/src/wasm/wasm-module.h
+index 492c51487f..bd4d800c79 100644
+--- a/src/wasm/wasm-module.h
++++ b/src/wasm/wasm-module.h
+@@ -136,6 +136,7 @@ struct V8_EXPORT_PRIVATE WasmModule {
+   bool has_shared_memory = false;  // true if memory is a SharedArrayBuffer
+   bool has_maximum_pages = false;  // true if there is a maximum memory size
+   bool has_memory = false;         // true if the memory was defined or imported
++  bool has_secret_memory = false;         // true if the memory was defined or imported as secret
+   bool mem_export = false;         // true if the memory is exported
+   int start_function_index = -1;   // start function, >= 0 if any
+ 
+diff --git a/src/wasm/wasm-objects-inl.h b/src/wasm/wasm-objects-inl.h
+index 0a85862174..c362bba583 100644
+--- a/src/wasm/wasm-objects-inl.h
++++ b/src/wasm/wasm-objects-inl.h
+@@ -39,6 +39,8 @@ ACCESSORS(WasmMemoryObject, array_buffer, JSArrayBuffer, kArrayBufferOffset)
+ SMI_ACCESSORS(WasmMemoryObject, maximum_pages, kMaximumPagesOffset)
+ OPTIONAL_ACCESSORS(WasmMemoryObject, instances, WeakFixedArray,
+                    kInstancesOffset)
++SMI_ACCESSORS(WasmMemoryObject, flag, kFlagOffset)
++BOOL_ACCESSORS(WasmMemoryObject, flag, is_secret, 0);
+ 
+ // WasmInstanceObject
+ ACCESSORS(WasmInstanceObject, wasm_context, Managed<WasmContext>,
+diff --git a/src/wasm/wasm-objects.cc b/src/wasm/wasm-objects.cc
+index c92a51716a..3a1e1eda21 100644
+--- a/src/wasm/wasm-objects.cc
++++ b/src/wasm/wasm-objects.cc
+@@ -469,7 +469,7 @@ void SetInstanceMemory(Isolate* isolate, Handle<WasmInstanceObject> instance,
+ 
+ Handle<WasmMemoryObject> WasmMemoryObject::New(
+     Isolate* isolate, MaybeHandle<JSArrayBuffer> maybe_buffer,
+-    int32_t maximum) {
++    int32_t maximum, bool is_secret) {
+   // TODO(kschimpf): Do we need to add an argument that defines the
+   // style of memory the user prefers (with/without trap handling), so
+   // that the memory will match the style of the compiled wasm module.
+@@ -478,7 +478,6 @@ Handle<WasmMemoryObject> WasmMemoryObject::New(
+       isolate->native_context()->wasm_memory_constructor());
+   auto memory_obj = Handle<WasmMemoryObject>::cast(
+       isolate->factory()->NewJSObject(memory_ctor, TENURED));
+-
+   Handle<JSArrayBuffer> buffer;
+   if (maybe_buffer.is_null()) {
+     // If no buffer was provided, create a 0-length one.
+@@ -495,7 +494,7 @@ Handle<WasmMemoryObject> WasmMemoryObject::New(
+   }
+   memory_obj->set_array_buffer(*buffer);
+   memory_obj->set_maximum_pages(maximum);
+-
++  memory_obj->set_is_secret(is_secret);
+   return memory_obj;
+ }
+ 
+diff --git a/src/wasm/wasm-objects.h b/src/wasm/wasm-objects.h
+index ec06531b5c..6b3d95f9db 100644
+--- a/src/wasm/wasm-objects.h
++++ b/src/wasm/wasm-objects.h
+@@ -145,12 +145,15 @@ class WasmMemoryObject : public JSObject {
+  public:
+   DECL_CAST(WasmMemoryObject)
+ 
++  DECL_INT_ACCESSORS(flag)
+   DECL_ACCESSORS(array_buffer, JSArrayBuffer)
+   DECL_INT_ACCESSORS(maximum_pages)
+   DECL_OPTIONAL_ACCESSORS(instances, WeakFixedArray)
+   DECL_ACCESSORS(wasm_context, Managed<WasmContext>)
++  DECL_BOOLEAN_ACCESSORS(is_secret)
+ 
+   enum {  // --
++    kFlagIndex,
+     kArrayBufferIndex,
+     kMaximumPagesIndex,
+     kInstancesIndex,
+@@ -159,6 +162,7 @@ class WasmMemoryObject : public JSObject {
+   };
+ 
+   DEF_SIZE(JSObject)
++  DEF_OFFSET(Flag)
+   DEF_OFFSET(ArrayBuffer)
+   DEF_OFFSET(MaximumPages)
+   DEF_OFFSET(Instances)
+@@ -172,11 +176,16 @@ class WasmMemoryObject : public JSObject {
+                              Handle<WasmInstanceObject> object);
+   uint32_t current_pages();
+   inline bool has_maximum_pages();
++  static const int kIsSecretIndex = 0;
+ 
+   V8_EXPORT_PRIVATE static Handle<WasmMemoryObject> New(
+-      Isolate* isolate, MaybeHandle<JSArrayBuffer> buffer, int32_t maximum);
++      Isolate* isolate, MaybeHandle<JSArrayBuffer> buffer, int32_t maximum,
++      bool is_secret = false);
+ 
+   static int32_t Grow(Isolate*, Handle<WasmMemoryObject>, uint32_t pages);
++
++  private:
++    DECL_INT_ACCESSORS(flags)
+ };
+ 
+ // A WebAssembly.Instance JavaScript-level object.
+diff --git a/src/wasm/wasm-opcodes.h b/src/wasm/wasm-opcodes.h
+index bafeb069e2..4e2d1a7817 100644
+--- a/src/wasm/wasm-opcodes.h
++++ b/src/wasm/wasm-opcodes.h
+@@ -475,6 +475,34 @@ using WasmName = Vector<const char>;
+   V(S32ClassifyI32, 0xfbc0, sec_i)    \
+   V(S64ClassifyI64, 0xfbc1, lsec_l)
+ 
++#define FOREACH_SECRET_LOAD_OPCODE(V) \
++  V(S32LoadMem, 0xfb28, sec_i)         \
++  V(S64LoadMem, 0xfb29, lsec_i)         \
++  V(S32LoadMem8S, 0xfb2c, sec_i)       \
++  V(S32LoadMem8U, 0xfb2d, sec_i)       \
++  V(S32LoadMem16S, 0xfb2e, sec_i)      \
++  V(S32LoadMem16U, 0xfb2f, sec_i)      \
++  V(S64LoadMem8S, 0xfb30, lsec_i)       \
++  V(S64LoadMem8U, 0xfb31, lsec_i)       \
++  V(S64LoadMem16S, 0xfb32, lsec_i)      \
++  V(S64LoadMem16U, 0xfb33, lsec_i)      \
++  V(S64LoadMem32S, 0xfb34, lsec_i)      \
++  V(S64LoadMem32U, 0xfb35, lsec_i)
++
++#define FOREACH_SECRET_STORE_OPCODE(V) \
++  V(S32StoreMem, 0xfb36, v_isec)       \
++  V(S64StoreMem, 0xfb37, v_ilsec)       \
++  V(S32StoreMem8, 0xfb3a, v_isec)      \
++  V(S32StoreMem16, 0xfb3b, v_isec)     \
++  V(S64StoreMem8, 0xfb3c, v_ilsec)      \
++  V(S64StoreMem16, 0xfb3d, v_ilsec)     \
++  V(S64StoreMem32, 0xfb3e, v_ilsec)
++
++#define FOREACH_SECRET_MEM_OPCODE(V) \
++  FOREACH_SECRET_LOAD_OPCODE(V) \
++  FOREACH_SECRET_STORE_OPCODE(V)
++
++
+ #define FOREACH_SIMD_MASK_OPERAND_OPCODE(V) V(S8x16Shuffle, 0xfd6b, s_ss)
+ 
+ #define FOREACH_SIMD_MEM_OPCODE(V) \
+@@ -532,7 +560,8 @@ using WasmName = Vector<const char>;
+   FOREACH_SIMD_MASK_OPERAND_OPCODE(V) \
+   FOREACH_SIMD_MEM_OPCODE(V)          \
+   FOREACH_ATOMIC_OPCODE(V)            \
+-  FOREACH_NUMERIC_OPCODE(V)
++  FOREACH_NUMERIC_OPCODE(V)           \
++  FOREACH_SECRET_MEM_OPCODE(V)
+ 
+ // All signatures.
+ #define FOREACH_SIGNATURE(V)             \
+@@ -577,6 +606,9 @@ using WasmName = Vector<const char>;
+   V(sec_lsec, kWasmS32, kWasmS64)             \
+   V(lsec_sec, kWasmS64, kWasmS32)             \
+   V(lsec_l, kWasmS64, kWasmI64)               \
++  V(lsec_i, kWasmS64, kWasmI32)               \
++  V(v_isec, kWasmStmt, kWasmI32, kWasmS32)               \
++  V(v_ilsec, kWasmStmt, kWasmI32, kWasmS64)               \
+   V(lsec_lsec, kWasmS64, kWasmS64)            \
+   V(lsec_lseclsec, kWasmS64, kWasmS64, kWasmS64) \
+   V(sec_lseclsec, kWasmS32, kWasmS64, kWasmS64)\
+@@ -624,9 +656,24 @@ enum TrapReason {
+ #undef DECLARE_ENUM
+ };
+ 
++#define FOREACH_SECRET_LOAD_TYPE(V) \
++  V(S32, , Int32, 2)         \
++  V(S32, 8S, Int8, 0)        \
++  V(S32, 8U, Uint8, 0)       \
++  V(S32, 16S, Int16, 1)      \
++  V(S32, 16U, Uint16, 1)     \
++  V(S64, , Int64, 3)         \
++  V(S64, 8S, Int8, 0)        \
++  V(S64, 8U, Uint8, 0)       \
++  V(S64, 16S, Int16, 1)      \
++  V(S64, 16U, Uint16, 1)     \
++  V(S64, 32S, Int32, 2)      \
++  V(S64, 32U, Uint32, 2)     \
++
+ // TODO(clemensh): Compute memtype and size from ValueType once we have c++14
+ // constexpr support.
+ #define FOREACH_LOAD_TYPE(V) \
++  FOREACH_SECRET_LOAD_TYPE(V) \
+   V(I32, , Int32, 2)         \
+   V(I32, 8S, Int8, 0)        \
+   V(I32, 8U, Uint8, 0)       \
+@@ -660,7 +707,16 @@ class LoadType {
+   constexpr unsigned size() const { return 1 << size_log_2(); }
+   constexpr ValueType value_type() const { return kValueType[val_]; }
+   constexpr MachineType mem_type() const { return kMemType[val_]; }
+-
++  constexpr bool secret() const {
++    switch(val_){
++      #define CASE_ENUM(type, suffix, ...) case k##type##Load##suffix:
++        FOREACH_SECRET_LOAD_TYPE(CASE_ENUM)
++      #undef CASE_ENUM
++        return true;
++      default:
++        return false;
++    }
++  }
+  private:
+   const LoadTypeValue val_;
+ 
+@@ -683,7 +739,17 @@ class LoadType {
+   };
+ };
+ 
++#define FOREACH_SECRET_STORE_TYPE(V) \
++  V(S32, , Word32, 2)         \
++  V(S32, 8, Word8, 0)         \
++  V(S32, 16, Word16, 1)       \
++  V(S64, , Word64, 3)         \
++  V(S64, 8, Word8, 0)         \
++  V(S64, 16, Word16, 1)       \
++  V(S64, 32, Word32, 2)       \
++
+ #define FOREACH_STORE_TYPE(V) \
++  FOREACH_SECRET_STORE_TYPE(V) \
+   V(I32, , Word32, 2)         \
+   V(I32, 8, Word8, 0)         \
+   V(I32, 16, Word16, 1)       \
+@@ -712,7 +778,16 @@ class StoreType {
+   constexpr unsigned size() const { return 1 << size_log_2(); }
+   constexpr ValueType value_type() const { return kValueType[val_]; }
+   constexpr ValueType mem_rep() const { return kMemRep[val_]; }
+-
++  constexpr bool secret() const {
++    switch(val_){
++      #define CASE_ENUM(type, suffix, ...) case k##type##Store##suffix:
++        FOREACH_SECRET_STORE_TYPE(CASE_ENUM)
++      #undef CASE_ENUM
++        return true;
++      default:
++        return false;
++    }
++  }
+  private:
+   const StoreTypeValue val_;
+ 
+-- 
+2.15.0
+
+
+From 4a299c345013f476848d48726b1a9d1f9566253a Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Tue, 1 May 2018 14:25:39 -0700
+Subject: [PATCH 05/15] Implement trusted functions
+
+---
+ src/signature.h            |  7 ++++++-
+ src/wasm/module-decoder.cc | 10 +++++++---
+ src/wasm/wasm-constants.h  |  1 +
+ src/wasm/wasm-opcodes.cc   | 16 +++++++++++++++-
+ src/wasm/wasm-opcodes.h    | 26 +++++++++++++++++++++++++-
+ 5 files changed, 54 insertions(+), 6 deletions(-)
+
+diff --git a/src/signature.h b/src/signature.h
+index 90f38d0353..75d77fee84 100644
+--- a/src/signature.h
++++ b/src/signature.h
+@@ -16,11 +16,14 @@ template <typename T>
+ class Signature : public ZoneObject {
+  public:
+   constexpr Signature(size_t return_count, size_t parameter_count,
+-                      const T* reps)
++                      const T* reps, bool is_trusted = false)
+       : return_count_(return_count),
+         parameter_count_(parameter_count),
++        is_trusted_(is_trusted),
+         reps_(reps) {}
+ 
++  bool is_trusted() const { return is_trusted_; }
++  void set_is_trusted(bool b) { is_trusted_ = b; }
+   size_t return_count() const { return return_count_; }
+   size_t parameter_count() const { return parameter_count_; }
+ 
+@@ -49,6 +52,7 @@ class Signature : public ZoneObject {
+     if (this == that) return true;
+     if (this->parameter_count() != that->parameter_count()) return false;
+     if (this->return_count() != that->return_count()) return false;
++    if (this->is_trusted() != that->is_trusted()) return false;
+     size_t size = this->return_count() + this->parameter_count();
+     for (size_t i = 0; i < size; i++) {
+       if (this->reps_[i] != that->reps_[i]) return false;
+@@ -95,6 +99,7 @@ class Signature : public ZoneObject {
+  protected:
+   size_t return_count_;
+   size_t parameter_count_;
++  bool is_trusted_;
+   const T* reps_;
+ };
+ 
+diff --git a/src/wasm/module-decoder.cc b/src/wasm/module-decoder.cc
+index 87417b0de6..aeec7c3a4e 100644
+--- a/src/wasm/module-decoder.cc
++++ b/src/wasm/module-decoder.cc
+@@ -1300,6 +1300,7 @@ class ModuleDecoderImpl : public Decoder {
+     }
+   }
+ 
++
+   FunctionSig* consume_sig(Zone* zone) {
+     constexpr bool has_return_values = true;
+     return consume_sig_internal(zone, has_return_values);
+@@ -1311,9 +1312,13 @@ class ModuleDecoderImpl : public Decoder {
+   }
+ 
+  private:
++
+   FunctionSig* consume_sig_internal(Zone* zone, bool has_return_values) {
+-    if (has_return_values && !expect_u8("type form", kWasmFunctionTypeCode))
++    byte type_signal = consume_u8("type form");
++    if (has_return_values && type_signal != kWasmFunctionTypeCode && type_signal != kWasmTrustedFunctionTypeCode) {
++      errorf(pc(), "expected type form, got 0x%02x", type_signal);
+       return nullptr;
++    }
+     // parse parameter types
+     uint32_t param_count =
+         consume_count("param count", kV8MaxWasmFunctionParams);
+@@ -1345,8 +1350,7 @@ class ModuleDecoderImpl : public Decoder {
+     uint32_t b = 0;
+     for (uint32_t i = 0; i < return_count; ++i) buffer[b++] = returns[i];
+     for (uint32_t i = 0; i < param_count; ++i) buffer[b++] = params[i];
+-
+-    return new (zone) FunctionSig(return_count, param_count, buffer);
++    return new (zone) FunctionSig(return_count, param_count, buffer, type_signal == kWasmTrustedFunctionTypeCode);
+   }
+ };
+ 
+diff --git a/src/wasm/wasm-constants.h b/src/wasm/wasm-constants.h
+index 394ede2914..1828787c8b 100644
+--- a/src/wasm/wasm-constants.h
++++ b/src/wasm/wasm-constants.h
+@@ -26,6 +26,7 @@ enum ValueTypeCode : uint8_t {
+ };
+ // Binary encoding of other types.
+ constexpr uint8_t kWasmFunctionTypeCode = 0x60;
++constexpr uint8_t kWasmTrustedFunctionTypeCode = 0x5f;
+ constexpr uint8_t kWasmAnyFunctionTypeCode = 0x70;
+ 
+ // Binary encoding of import/export kinds.
+diff --git a/src/wasm/wasm-opcodes.cc b/src/wasm/wasm-opcodes.cc
+index 9f06f8ed7d..46525dfe80 100644
+--- a/src/wasm/wasm-opcodes.cc
++++ b/src/wasm/wasm-opcodes.cc
+@@ -346,6 +346,8 @@ namespace {
+ enum WasmOpcodeSig : byte {
+   kSigEnum_None,
+   FOREACH_SIGNATURE(DECLARE_SIG_ENUM)
++  kSigEnum_t_lsec_l,
++  kSigEnum_t_sec_i
+ };
+ #undef DECLARE_SIG_ENUM
+ #define DECLARE_SIG(name, ...)                                                \
+@@ -357,9 +359,21 @@ enum WasmOpcodeSig : byte {
+ FOREACH_SIGNATURE(DECLARE_SIG)
+ #undef DECLARE_SIG
+ 
++constexpr ValueType kTypes_t_lsec_l[] = {kWasmI64, kWasmS64};
++constexpr int kReturnsCount_t_lsec_l = kTypes_t_lsec_l[0] == kWasmStmt ? 0 : 1;
++constexpr FunctionSig kSig_t_lsec_l(
++    kReturnsCount_t_lsec_l, static_cast<int>(arraysize(kTypes_t_lsec_l)) - 1,
++    kTypes_t_lsec_l + (1 - kReturnsCount_t_lsec_l), true);
++
++constexpr ValueType kTypes_t_sec_i[] = {kWasmI32, kWasmS32};
++constexpr int kReturnsCount_t_sec_i = kTypes_t_sec_i[0] == kWasmStmt ? 0 : 1;
++constexpr FunctionSig kSig_t_sec_i(
++    kReturnsCount_t_sec_i, static_cast<int>(arraysize(kTypes_t_sec_i)) - 1,
++    kTypes_t_sec_i + (1 - kReturnsCount_t_sec_i), true);
++
+ #define DECLARE_SIG_ENTRY(name, ...) &kSig_##name,
+ constexpr const FunctionSig* kSimpleExprSigs[] = {
+-    nullptr, FOREACH_SIGNATURE(DECLARE_SIG_ENTRY)};
++    nullptr, FOREACH_SIGNATURE(DECLARE_SIG_ENTRY) &kSig_t_sec_i, &kSig_t_lsec_l};
+ #undef DECLARE_SIG_ENTRY
+ 
+ // gcc 4.7 - 4.9 has a bug which causes the constexpr attribute to get lost when
+diff --git a/src/wasm/wasm-opcodes.h b/src/wasm/wasm-opcodes.h
+index 4e2d1a7817..6147f05253 100644
+--- a/src/wasm/wasm-opcodes.h
++++ b/src/wasm/wasm-opcodes.h
+@@ -46,8 +46,32 @@ constexpr ValueType kWasmF32 = MachineRepresentation::kFloat32;
+ constexpr ValueType kWasmF64 = MachineRepresentation::kFloat64;
+ constexpr ValueType kWasmS128 = MachineRepresentation::kSimd128;
+ constexpr ValueType kWasmVar = MachineRepresentation::kTagged;
+-
+ using FunctionSig = Signature<ValueType>;
++/*
++class FunctionSig {
++  public:
++
++  FunctionSig(Signature<ValueType> s) : sig(s){ }
++  template <typename ...Args>
++  FunctionSig(Args ...args) : sig(Signature<ValueType>(args...)){}
++
++  class Builder : public Signature<ValueType>::Builder  {
++    public:
++      template <typename ...Args>
++      Builder(Args ...args) : Signature<ValueType>::Builder(args...) {}
++
++  };
++
++  operator Signature<ValueType>() { return sig; }
++
++  bool is_trusted() { return trusted; }
++  void set_is_trusted(bool t) { trusted = t; }
++
++ private:
++  bool trusted = false;
++  Signature<ValueType> sig;
++};
++*/
+ std::ostream& operator<<(std::ostream& os, const FunctionSig& function);
+ bool IsJSCompatibleSignature(const FunctionSig* sig);
+ 
+-- 
+2.15.0
+
+
+From 52cbf54a055a7417a1c5ba9a9c12c3f9044243a5 Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Tue, 1 May 2018 16:07:04 -0700
+Subject: [PATCH 06/15] Implement classification primitives
+
+---
+ src/compiler/wasm-compiler.cc         |  7 +++++--
+ src/wasm/function-body-decoder-impl.h |  4 ++++
+ src/wasm/wasm-opcodes.cc              | 26 +++++++++++++-------------
+ src/wasm/wasm-opcodes.h               |  6 ++++--
+ 4 files changed, 26 insertions(+), 17 deletions(-)
+
+diff --git a/src/compiler/wasm-compiler.cc b/src/compiler/wasm-compiler.cc
+index 58e7606c67..c5e4646f6e 100644
+--- a/src/compiler/wasm-compiler.cc
++++ b/src/compiler/wasm-compiler.cc
+@@ -4026,11 +4026,9 @@ Node* WasmGraphBuilder::SecretOp(wasm::WasmOpcode opcode, Node* const* inputs) {
+       return graph()->NewNode(m->Word32Equal(), inputs[0], jsgraph()->Int32Constant(0));
+     case wasm::kExprS32Clz:
+       return graph()->NewNode(m->Word32Clz(), inputs[0]);
+-      break;
+     case wasm::kExprS32Ctz: {
+       if (m->Word32Ctz().IsSupported()) {
+         return graph()->NewNode(m->Word32Ctz().op(), inputs[0]);
+-        break;
+       } else if (m->Word32ReverseBits().IsSupported()) {
+         Node* reversed = graph()->NewNode(m->Word32ReverseBits().op(), inputs[0]);
+         Node* result = graph()->NewNode(m->Word32Clz(), reversed);
+@@ -4178,6 +4176,11 @@ Node* WasmGraphBuilder::SecretOp(wasm::WasmOpcode opcode, Node* const* inputs) {
+       return BuildI64Rol(inputs[0], inputs[1]);
+     case wasm::kExprS64Eqz:
+       return graph()->NewNode(m->Word64Equal(), inputs[0], jsgraph()->Int64Constant(0));
++    case wasm::kExprS32Classify:
++    case wasm::kExprS64Classify:
++    case wasm::kExprI32Declassify:
++    case wasm::kExprI64Declassify:
++      return inputs[0];
+     default:
+       FATAL_UNSUPPORTED_OPCODE(opcode);
+   }
+diff --git a/src/wasm/function-body-decoder-impl.h b/src/wasm/function-body-decoder-impl.h
+index bae0d53d40..1e99503744 100644
+--- a/src/wasm/function-body-decoder-impl.h
++++ b/src/wasm/function-body-decoder-impl.h
+@@ -2027,6 +2027,10 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+   // Pops arguments as required by signature into {args_}.
+   V8_INLINE void PopArgs(FunctionSig* sig) {
+     int count = sig ? static_cast<int>(sig->parameter_count()) : 0;
++    if(!this->sig_->is_trusted() && sig->is_trusted()){
++      this->errorf(this->pc_, "attempted to perform trusted operation in untrusted function %s",
++                    SafeOpcodeNameAt(this->pc_));
++    }
+     args_.resize(count);
+     for (int i = count - 1; i >= 0; --i) {
+       args_[i] = Pop(i, sig->GetParam(i));
+diff --git a/src/wasm/wasm-opcodes.cc b/src/wasm/wasm-opcodes.cc
+index 46525dfe80..6127fa4472 100644
+--- a/src/wasm/wasm-opcodes.cc
++++ b/src/wasm/wasm-opcodes.cc
+@@ -346,8 +346,8 @@ namespace {
+ enum WasmOpcodeSig : byte {
+   kSigEnum_None,
+   FOREACH_SIGNATURE(DECLARE_SIG_ENUM)
+-  kSigEnum_t_lsec_l,
+-  kSigEnum_t_sec_i
++  kSigEnum_t_l_lsec,
++  kSigEnum_t_i_sec
+ };
+ #undef DECLARE_SIG_ENUM
+ #define DECLARE_SIG(name, ...)                                                \
+@@ -359,21 +359,21 @@ enum WasmOpcodeSig : byte {
+ FOREACH_SIGNATURE(DECLARE_SIG)
+ #undef DECLARE_SIG
+ 
+-constexpr ValueType kTypes_t_lsec_l[] = {kWasmI64, kWasmS64};
+-constexpr int kReturnsCount_t_lsec_l = kTypes_t_lsec_l[0] == kWasmStmt ? 0 : 1;
+-constexpr FunctionSig kSig_t_lsec_l(
+-    kReturnsCount_t_lsec_l, static_cast<int>(arraysize(kTypes_t_lsec_l)) - 1,
+-    kTypes_t_lsec_l + (1 - kReturnsCount_t_lsec_l), true);
++constexpr ValueType kTypes_t_l_lsec[] = {kWasmI64, kWasmS64};
++constexpr int kReturnsCount_t_l_lsec = kTypes_t_l_lsec[0] == kWasmStmt ? 0 : 1;
++constexpr FunctionSig kSig_t_l_lsec(
++    kReturnsCount_t_l_lsec, static_cast<int>(arraysize(kTypes_t_l_lsec)) - 1,
++    kTypes_t_l_lsec + (1 - kReturnsCount_t_l_lsec), true);
+ 
+-constexpr ValueType kTypes_t_sec_i[] = {kWasmI32, kWasmS32};
+-constexpr int kReturnsCount_t_sec_i = kTypes_t_sec_i[0] == kWasmStmt ? 0 : 1;
+-constexpr FunctionSig kSig_t_sec_i(
+-    kReturnsCount_t_sec_i, static_cast<int>(arraysize(kTypes_t_sec_i)) - 1,
+-    kTypes_t_sec_i + (1 - kReturnsCount_t_sec_i), true);
++constexpr ValueType kTypes_t_i_sec[] = {kWasmI32, kWasmS32};
++constexpr int kReturnsCount_t_i_sec = kTypes_t_i_sec[0] == kWasmStmt ? 0 : 1;
++constexpr FunctionSig kSig_t_i_sec(
++    kReturnsCount_t_i_sec, static_cast<int>(arraysize(kTypes_t_i_sec)) - 1,
++    kTypes_t_i_sec + (1 - kReturnsCount_t_i_sec), true);
+ 
+ #define DECLARE_SIG_ENTRY(name, ...) &kSig_##name,
+ constexpr const FunctionSig* kSimpleExprSigs[] = {
+-    nullptr, FOREACH_SIGNATURE(DECLARE_SIG_ENTRY) &kSig_t_sec_i, &kSig_t_lsec_l};
++    nullptr, FOREACH_SIGNATURE(DECLARE_SIG_ENTRY) &kSig_t_l_lsec, &kSig_t_i_sec};
+ #undef DECLARE_SIG_ENTRY
+ 
+ // gcc 4.7 - 4.9 has a bug which causes the constexpr attribute to get lost when
+diff --git a/src/wasm/wasm-opcodes.h b/src/wasm/wasm-opcodes.h
+index 6147f05253..7e3c9e8270 100644
+--- a/src/wasm/wasm-opcodes.h
++++ b/src/wasm/wasm-opcodes.h
+@@ -496,8 +496,10 @@ using WasmName = Vector<const char>;
+   V(S32ConvertS64, 0xfba7, sec_lsec)     \
+   V(S64SConvertS32, 0xfbac, lsec_sec) \
+   V(S64UConvertS32, 0xfbad, lsec_sec) \
+-  V(S32ClassifyI32, 0xfbc0, sec_i)    \
+-  V(S64ClassifyI64, 0xfbc1, lsec_l)
++  V(S32Classify, 0xfbc0, sec_i)    \
++  V(S64Classify, 0xfbc1, lsec_l)   \
++  V(I32Declassify, 0xfbc2, t_i_sec) \
++  V(I64Declassify, 0xfbc3, t_l_lsec) \
+ 
+ #define FOREACH_SECRET_LOAD_OPCODE(V) \
+   V(S32LoadMem, 0xfb28, sec_i)         \
+-- 
+2.15.0
+
+
+From ea009ce145b3f8edf21f5b8fbca0f2af34485288 Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Fri, 4 May 2018 13:57:00 -0700
+Subject: [PATCH 07/15] Support error messages for secret instructions
+
+---
+ src/wasm/function-body-decoder-impl.h | 16 ++++++++-
+ src/wasm/wasm-opcodes.cc              | 49 +++++++++++++++++++++++++++
+ 2 files changed, 64 insertions(+), 1 deletion(-)
+
+diff --git a/src/wasm/function-body-decoder-impl.h b/src/wasm/function-body-decoder-impl.h
+index 1e99503744..3fd05dd5d7 100644
+--- a/src/wasm/function-body-decoder-impl.h
++++ b/src/wasm/function-body-decoder-impl.h
+@@ -1261,7 +1261,21 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+ 
+   const char* SafeOpcodeNameAt(const byte* pc) {
+     if (pc >= this->end_) return "<end>";
+-    return WasmOpcodes::OpcodeName(static_cast<WasmOpcode>(*pc));
++    WasmOpcode opcode = static_cast<WasmOpcode>(*pc);
++    switch (opcode) {
++      #define PREFIX_CASE(name, _)                      \
++        case k##name##Prefix: {                              \
++          if (pc + 1 >= this->end_) {                        \
++            return "<##name prefix>";                        \
++          }                                                  \
++          opcode = static_cast<WasmOpcode>(opcode << 8 | *(pc + 1)); \
++          break;                                             \
++        }
++      FOREACH_PREFIX(PREFIX_CASE)
++      default:
++        break;
++    }
++    return WasmOpcodes::OpcodeName(opcode);
+   }
+ 
+   inline Zone* zone() const { return zone_; }
+diff --git a/src/wasm/wasm-opcodes.cc b/src/wasm/wasm-opcodes.cc
+index 6127fa4472..2cf27638b0 100644
+--- a/src/wasm/wasm-opcodes.cc
++++ b/src/wasm/wasm-opcodes.cc
+@@ -20,6 +20,8 @@ namespace wasm {
+     return str;
+ #define CASE_I32_OP(name, str) CASE_OP(I32##name, "i32." str)
+ #define CASE_I64_OP(name, str) CASE_OP(I64##name, "i64." str)
++#define CASE_S32_OP(name, str) CASE_OP(S32##name, "s32." str)
++#define CASE_S64_OP(name, str) CASE_OP(S64##name, "s64." str)
+ #define CASE_F32_OP(name, str) CASE_OP(F32##name, "f32." str)
+ #define CASE_F64_OP(name, str) CASE_OP(F64##name, "f64." str)
+ #define CASE_F32x4_OP(name, str) CASE_OP(F32x4##name, "f32x4." str)
+@@ -36,6 +38,7 @@ namespace wasm {
+ #define CASE_INT_OP(name, str) CASE_I32_OP(name, str) CASE_I64_OP(name, str)
+ #define CASE_FLOAT_OP(name, str) CASE_F32_OP(name, str) CASE_F64_OP(name, str)
+ #define CASE_ALL_OP(name, str) CASE_FLOAT_OP(name, str) CASE_INT_OP(name, str)
++#define CASE_SECRET_OP(name, str) CASE_S32_OP(name, str) CASE_S64_OP(name, str)
+ #define CASE_SIMD_OP(name, str)                                              \
+   CASE_F32x4_OP(name, str) CASE_I32x4_OP(name, str) CASE_I16x8_OP(name, str) \
+       CASE_I8x16_OP(name, str)
+@@ -252,6 +255,49 @@ const char* WasmOpcodes::OpcodeName(WasmOpcode opcode) {
+     CASE_U32_OP(AtomicExchange, "atomic_xchng")
+     CASE_U32_OP(AtomicCompareExchange, "atomic_cmpxchng")
+ 
++    CASE_SECRET_OP(Eqz, "eqz")
++    CASE_SECRET_OP(Eq, "eq")
++    CASE_SECRET_OP(Ne, "ne")
++    CASE_SECRET_OP(LtS, "lt_s")
++    CASE_SECRET_OP(LtU, "lt_u")
++    CASE_SECRET_OP(GtS, "gt_s")
++    CASE_SECRET_OP(GtU, "gt_u")
++    CASE_SECRET_OP(LeS, "le_s")
++    CASE_SECRET_OP(LeU, "le_u")
++    CASE_SECRET_OP(GeS, "ge_s")
++    CASE_SECRET_OP(GeU, "ge_u")
++    CASE_SECRET_OP(Clz, "clz")
++    CASE_SECRET_OP(Ctz, "ctz")
++    CASE_SECRET_OP(Popcnt, "popcnt")
++    CASE_SECRET_OP(Add, "add")
++    CASE_SECRET_OP(Sub, "sub")
++    CASE_SECRET_OP(Mul, "mul")
++    CASE_SECRET_OP(And, "and")
++    CASE_SECRET_OP(Ior, "ior")
++    CASE_SECRET_OP(Xor, "xor")
++    CASE_SECRET_OP(Shl, "shl")
++    CASE_SECRET_OP(ShrS, "shr_s")
++    CASE_SECRET_OP(ShrU, "shr_u")
++    CASE_SECRET_OP(Rol, "rol")
++    CASE_SECRET_OP(Ror, "ror")
++    CASE_SECRET_OP(Const, "const")
++
++    CASE_SECRET_OP(LoadMem, "load")
++    CASE_SIGN_OP(SECRET, LoadMem8, "load8")
++    CASE_SIGN_OP(SECRET, LoadMem16, "load16")
++    CASE_SIGN_OP(S64, LoadMem32, "load32")
++
++    CASE_SECRET_OP(StoreMem, "store")
++    CASE_SECRET_OP(StoreMem8, "store8")
++    CASE_SECRET_OP(StoreMem16, "store16")
++    CASE_S64_OP(StoreMem32, "store32")
++
++    CASE_S32_OP(ConvertS64, "wrap/s64")
++    CASE_S64_OP(SConvertS32, "extend_s/s32")
++    CASE_S64_OP(UConvertS32, "extend_u/s32")
++    CASE_SECRET_OP(Classify, "classify")
++    CASE_INT_OP(Declassify, "declassify")
++
+     default : return "unknown";
+     // clang-format on
+   }
+@@ -285,6 +331,9 @@ const char* WasmOpcodes::OpcodeName(WasmOpcode opcode) {
+ #undef CASE_CONVERT_SAT_OP
+ #undef CASE_L32_OP
+ #undef CASE_U32_OP
++#undef CASE_S32_OP
++#undef CASE_S64_OP
++#undef CASE_SECRET_OP
+ 
+ bool WasmOpcodes::IsPrefixOpcode(WasmOpcode opcode) {
+   switch (opcode) {
+-- 
+2.15.0
+
+
+From 31c70b1061dfe6cfee958c73cfbe66b72bf49d0d Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Mon, 7 May 2018 12:31:30 -0700
+Subject: [PATCH 08/15] Implement secret_select
+
+---
+ src/wasm/function-body-decoder-impl.h | 15 +++++++++++++++
+ src/wasm/wasm-opcodes.cc              |  1 +
+ src/wasm/wasm-opcodes.h               |  1 +
+ 3 files changed, 17 insertions(+)
+
+diff --git a/src/wasm/function-body-decoder-impl.h b/src/wasm/function-body-decoder-impl.h
+index 3fd05dd5d7..0dde27df69 100644
+--- a/src/wasm/function-body-decoder-impl.h
++++ b/src/wasm/function-body-decoder-impl.h
+@@ -1133,6 +1133,8 @@ class WasmDecoder : public Decoder {
+       case kSimdPrefix: {
+         opcode = static_cast<WasmOpcode>(opcode << 8 | *(pc + 1));
+         switch (opcode) {
++          case kExprSecretSelect:
++            return {3, 1};
+           case kExprI32AtomicStore:
+           case kExprI32AtomicStore8U:
+           case kExprI32AtomicStore16U:
+@@ -2237,6 +2239,19 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+         len = operand.length;
+         break;
+       }
++      case kExprSecretSelect: {
++        auto cond = Pop(2, kWasmS32);
++        auto fval = Pop();
++        auto tval = Pop(0, fval.type);
++        if(fval.type != kWasmS32 && fval.type != kWasmS64) {
++          this->errorf(this->pc_,
++                       "attempted to secret switch with non-secret operands");
++          break;
++        }
++        auto* result = Push(tval.type == kWasmVar ? fval.type : tval.type);
++        CALL_INTERFACE_IF_REACHABLE(Select, cond, fval, tval, result);
++        break;
++      }
+       case kExprS32LoadMem8S:
+         len = DecodeLoadMem(LoadType::kS32Load8S, 1);
+         break;
+diff --git a/src/wasm/wasm-opcodes.cc b/src/wasm/wasm-opcodes.cc
+index 2cf27638b0..3873ea6b56 100644
+--- a/src/wasm/wasm-opcodes.cc
++++ b/src/wasm/wasm-opcodes.cc
+@@ -297,6 +297,7 @@ const char* WasmOpcodes::OpcodeName(WasmOpcode opcode) {
+     CASE_S64_OP(UConvertS32, "extend_u/s32")
+     CASE_SECRET_OP(Classify, "classify")
+     CASE_INT_OP(Declassify, "declassify")
++    CASE_OP(SecretSelect, "secret_select")
+ 
+     default : return "unknown";
+     // clang-format on
+diff --git a/src/wasm/wasm-opcodes.h b/src/wasm/wasm-opcodes.h
+index 7e3c9e8270..96995acf2e 100644
+--- a/src/wasm/wasm-opcodes.h
++++ b/src/wasm/wasm-opcodes.h
+@@ -111,6 +111,7 @@ using WasmName = Vector<const char>;
+   V(I64Const, 0x42, _)         \
+   V(S32Const, 0xfb41, _)                  \
+   V(S64Const, 0xfb42, _)                  \
++  V(SecretSelect, 0xfb1b, _)           \
+   V(F32Const, 0x43, _)         \
+   V(F64Const, 0x44, _)
+ 
+-- 
+2.15.0
+
+
+From 110cab344e45f8d9473e476a80e7d8603873f7f6 Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Mon, 7 May 2018 17:11:41 -0700
+Subject: [PATCH 09/15] Fix segfault when Pop sig is null
+
+---
+ src/wasm/function-body-decoder-impl.h | 2 +-
+ src/wasm/wasm-module.h                | 1 +
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/wasm/function-body-decoder-impl.h b/src/wasm/function-body-decoder-impl.h
+index 0dde27df69..522203f08d 100644
+--- a/src/wasm/function-body-decoder-impl.h
++++ b/src/wasm/function-body-decoder-impl.h
+@@ -2043,7 +2043,7 @@ class WasmFullDecoder : public WasmDecoder<validate> {
+   // Pops arguments as required by signature into {args_}.
+   V8_INLINE void PopArgs(FunctionSig* sig) {
+     int count = sig ? static_cast<int>(sig->parameter_count()) : 0;
+-    if(!this->sig_->is_trusted() && sig->is_trusted()){
++    if(sig != nullptr && !this->sig_->is_trusted() && sig->is_trusted()){
+       this->errorf(this->pc_, "attempted to perform trusted operation in untrusted function %s",
+                     SafeOpcodeNameAt(this->pc_));
+     }
+diff --git a/src/wasm/wasm-module.h b/src/wasm/wasm-module.h
+index bd4d800c79..40f4ce77c5 100644
+--- a/src/wasm/wasm-module.h
++++ b/src/wasm/wasm-module.h
+@@ -45,6 +45,7 @@ struct WasmFunction {
+   WireBytesRef code;     // code of this function.
+   bool imported;
+   bool exported;
++  bool trusted = false;
+ };
+ 
+ // Static representation of a wasm global variable.
+-- 
+2.15.0
+
+
+From 7affd4319dadf7c66a78baa1ba60862444ec2b29 Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Mon, 4 Jun 2018 00:34:44 -0700
+Subject: [PATCH 10/15] Allow creation of secret memories in JS
+
+---
+ src/wasm/wasm-js.cc | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/src/wasm/wasm-js.cc b/src/wasm/wasm-js.cc
+index ce2bf42455..4bfb511536 100644
+--- a/src/wasm/wasm-js.cc
++++ b/src/wasm/wasm-js.cc
+@@ -609,6 +609,19 @@ void WebAssemblyMemory(const v8::FunctionCallbackInfo<v8::Value>& args) {
+     }
+   }
+ 
++  // The descriptor's 'maximum'.
++  bool is_secret = false;
++  Local<String> secret_key = v8_str(isolate, "secret");
++  Maybe<bool> has_secret = descriptor->Has(context, secret_key);
++
++  if (!has_secret.IsNothing() && has_secret.FromJust()) {
++    v8::MaybeLocal<v8::Value> maybe = descriptor->Get(context, secret_key);
++    v8::Local<v8::Value> value;
++    if (maybe.ToLocal(&value)) {
++      if (!value->BooleanValue(context).To(&is_secret)) return;
++    }
++  }
++
+   bool is_shared_memory = false;
+   if (i::FLAG_experimental_wasm_threads) {
+     // Shared property of descriptor
+@@ -648,7 +661,7 @@ void WebAssemblyMemory(const v8::FunctionCallbackInfo<v8::Value>& args) {
+     }
+   }
+   i::Handle<i::JSObject> memory_obj = i::WasmMemoryObject::New(
+-      i_isolate, buffer, static_cast<int32_t>(maximum));
++      i_isolate, buffer, static_cast<int32_t>(maximum), is_secret);
+   args.GetReturnValue().Set(Utils::ToLocal(memory_obj));
+ }
+ 
+-- 
+2.15.0
+
+
+From 0f278db9113df3a870958e5639ff310237f8a768 Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Tue, 5 Jun 2018 12:59:39 -0700
+Subject: [PATCH 11/15] Support secret globals
+
+---
+ src/wasm/module-compiler.cc |  2 ++
+ src/wasm/module-decoder.cc  | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 32 insertions(+)
+
+diff --git a/src/wasm/module-compiler.cc b/src/wasm/module-compiler.cc
+index cf5ff92c38..d222b39a8d 100644
+--- a/src/wasm/module-compiler.cc
++++ b/src/wasm/module-compiler.cc
+@@ -3118,9 +3118,11 @@ T* InstanceBuilder::GetRawGlobalPtr(WasmGlobal& global) {
+ void InstanceBuilder::InitGlobals() {
+   for (auto global : module_->globals) {
+     switch (global.init.kind) {
++      case WasmInitExpr::kS32Const:
+       case WasmInitExpr::kI32Const:
+         *GetRawGlobalPtr<int32_t>(global) = global.init.val.i32_const;
+         break;
++      case WasmInitExpr::kS64Const:
+       case WasmInitExpr::kI64Const:
+         *GetRawGlobalPtr<int64_t>(global) = global.init.val.i64_const;
+         break;
+diff --git a/src/wasm/module-decoder.cc b/src/wasm/module-decoder.cc
+index aeec7c3a4e..4ba073b70b 100644
+--- a/src/wasm/module-decoder.cc
++++ b/src/wasm/module-decoder.cc
+@@ -103,6 +103,10 @@ ValueType TypeOf(const WasmModule* module, const WasmInitExpr& expr) {
+       return kWasmI32;
+     case WasmInitExpr::kI64Const:
+       return kWasmI64;
++    case WasmInitExpr::kS32Const:
++      return kWasmS32;
++    case WasmInitExpr::kS64Const:
++      return kWasmS64;
+     case WasmInitExpr::kF32Const:
+       return kWasmF32;
+     case WasmInitExpr::kF64Const:
+@@ -1216,6 +1220,32 @@ class ModuleDecoderImpl : public Decoder {
+         len = operand.length;
+         break;
+       }
++      case kSecretPrefix: {
++        WasmOpcode sec_opcode = static_cast<WasmOpcode>(opcode << 8 | consume_u8("secret opcode"));
++        switch(sec_opcode) {
++          case kExprS32Const: {
++            ImmI32Operand<Decoder::kValidate> operand(this, pc() -1);
++            expr.kind = WasmInitExpr::kS32Const;
++            expr.val.i32_const = operand.value;
++            len = operand.length;
++            break;
++          }
++          case kExprS64Const: {
++            ImmI64Operand<Decoder::kValidate> operand(this, pc() - 1);
++            expr.kind = WasmInitExpr::kS64Const;
++            expr.val.i64_const = operand.value;
++            len = operand.length;
++            break;
++          }
++          default: {
++            error("invalid opcode in initialization expression");
++            expr.kind = WasmInitExpr::kNone;
++            expr.val.i32_const = 0;
++            break;
++          }
++        }
++        break;
++      }
+       case kExprI32Const: {
+         ImmI32Operand<Decoder::kValidate> operand(this, pc() - 1);
+         expr.kind = WasmInitExpr::kI32Const;
+-- 
+2.15.0
+
+
+From c524a3b684171706f7e1e5180229aaf406895bd3 Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Tue, 5 Jun 2018 13:16:07 -0700
+Subject: [PATCH 12/15] Fixed parsing issue with secret consts
+
+---
+ src/wasm/function-body-decoder-impl.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/wasm/function-body-decoder-impl.h b/src/wasm/function-body-decoder-impl.h
+index 522203f08d..56a128ee00 100644
+--- a/src/wasm/function-body-decoder-impl.h
++++ b/src/wasm/function-body-decoder-impl.h
+@@ -1055,11 +1055,11 @@ class WasmDecoder : public Decoder {
+           }
+           case kExprS32Const: {
+             ImmI32Operand<validate> operand(decoder, pc + 1);
+-            return 1 + operand.length;
++            return 2 + operand.length;
+           }
+           case kExprS64Const: {
+             ImmI64Operand<validate> operand(decoder, pc + 1);
+-            return 1 + operand.length;
++            return 2 + operand.length;
+           }
+           default:
+             decoder->error(pc, "invalid Secrets opcode");
+-- 
+2.15.0
+
+
+From 7403b9dae57bdc29d77d4c27d4d7356481aebb31 Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Wed, 27 Jun 2018 23:47:32 -0700
+Subject: [PATCH 13/15] Fix s64 truncation issue
+
+---
+ src/wasm/baseline/liftoff-compiler.cc | 6 +++---
+ src/wasm/function-body-decoder.cc     | 2 +-
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/wasm/baseline/liftoff-compiler.cc b/src/wasm/baseline/liftoff-compiler.cc
+index 41e2ee2480..d4d2817945 100644
+--- a/src/wasm/baseline/liftoff-compiler.cc
++++ b/src/wasm/baseline/liftoff-compiler.cc
+@@ -577,11 +577,11 @@ class LiftoffCompiler {
+   }
+ 
+   void S32Const(Decoder* decoder, Value* result, int32_t value) {
+-    unsupported(decoder, "f64.const");
++    unsupported(decoder, "s32.const");
+   }
+ 
+-  void S64Const(Decoder* decoder, Value* result, int32_t value) {
+-    unsupported(decoder, "f64.const");
++  void S64Const(Decoder* decoder, Value* result, int64_t value) {
++    unsupported(decoder, "s64.const");
+   }
+ 
+   void F32Const(Decoder* decoder, Value* result, float value) {
+diff --git a/src/wasm/function-body-decoder.cc b/src/wasm/function-body-decoder.cc
+index 143da465e8..4d7052070d 100644
+--- a/src/wasm/function-body-decoder.cc
++++ b/src/wasm/function-body-decoder.cc
+@@ -227,7 +227,7 @@ class WasmGraphBuildingInterface {
+     result->node = builder_->Int32Constant(value);
+   }
+ 
+-  void S64Const(Decoder* decoder, Value* result, int32_t value) {
++  void S64Const(Decoder* decoder, Value* result, int64_t value) {
+     result->node = builder_->Int64Constant(value);
+   }
+ 
+-- 
+2.15.0
+
+
+From bb4dfa19ca58a7ebf39221480eaebb12bee8251a Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Fri, 29 Jun 2018 20:41:42 -0700
+Subject: [PATCH 14/15] Resolve some deep-seated trust issues
+
+---
+ src/wasm/module-decoder.cc | 4 ++--
+ src/wasm/wasm-constants.h  | 2 +-
+ src/wasm/wasm-module.h     | 2 +-
+ 3 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/wasm/module-decoder.cc b/src/wasm/module-decoder.cc
+index 4ba073b70b..fb7be09703 100644
+--- a/src/wasm/module-decoder.cc
++++ b/src/wasm/module-decoder.cc
+@@ -1345,7 +1345,7 @@ class ModuleDecoderImpl : public Decoder {
+ 
+   FunctionSig* consume_sig_internal(Zone* zone, bool has_return_values) {
+     byte type_signal = consume_u8("type form");
+-    if (has_return_values && type_signal != kWasmFunctionTypeCode && type_signal != kWasmTrustedFunctionTypeCode) {
++    if (has_return_values && type_signal != kWasmFunctionTypeCode && type_signal != kWasmUntrustedFunctionTypeCode) {
+       errorf(pc(), "expected type form, got 0x%02x", type_signal);
+       return nullptr;
+     }
+@@ -1380,7 +1380,7 @@ class ModuleDecoderImpl : public Decoder {
+     uint32_t b = 0;
+     for (uint32_t i = 0; i < return_count; ++i) buffer[b++] = returns[i];
+     for (uint32_t i = 0; i < param_count; ++i) buffer[b++] = params[i];
+-    return new (zone) FunctionSig(return_count, param_count, buffer, type_signal == kWasmTrustedFunctionTypeCode);
++    return new (zone) FunctionSig(return_count, param_count, buffer, type_signal != kWasmUntrustedFunctionTypeCode);
+   }
+ };
+ 
+diff --git a/src/wasm/wasm-constants.h b/src/wasm/wasm-constants.h
+index 1828787c8b..d71aef6174 100644
+--- a/src/wasm/wasm-constants.h
++++ b/src/wasm/wasm-constants.h
+@@ -26,7 +26,7 @@ enum ValueTypeCode : uint8_t {
+ };
+ // Binary encoding of other types.
+ constexpr uint8_t kWasmFunctionTypeCode = 0x60;
+-constexpr uint8_t kWasmTrustedFunctionTypeCode = 0x5f;
++constexpr uint8_t kWasmUntrustedFunctionTypeCode = 0x5f;
+ constexpr uint8_t kWasmAnyFunctionTypeCode = 0x70;
+ 
+ // Binary encoding of import/export kinds.
+diff --git a/src/wasm/wasm-module.h b/src/wasm/wasm-module.h
+index 40f4ce77c5..0f9daf68a6 100644
+--- a/src/wasm/wasm-module.h
++++ b/src/wasm/wasm-module.h
+@@ -45,7 +45,7 @@ struct WasmFunction {
+   WireBytesRef code;     // code of this function.
+   bool imported;
+   bool exported;
+-  bool trusted = false;
++  bool trusted = true;
+ };
+ 
+ // Static representation of a wasm global variable.
+-- 
+2.15.0
+
+
+From c42081bfac0189001a390cee989b8513521c1648 Mon Sep 17 00:00:00 2001
+From: John Renner <john@jrenner.net>
+Date: Sat, 30 Jun 2018 10:21:40 -0700
+Subject: [PATCH 15/15] Disallow JS functions for untrusted imports
+
+---
+ src/wasm/module-compiler.cc | 27 ++++++++++++++++++---------
+ 1 file changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/src/wasm/module-compiler.cc b/src/wasm/module-compiler.cc
+index d222b39a8d..de5f1a8ef1 100644
+--- a/src/wasm/module-compiler.cc
++++ b/src/wasm/module-compiler.cc
+@@ -1966,15 +1966,16 @@ WasmCodeWrapper UnwrapExportOrCompileImportWrapper(
+         isolate, Handle<WasmExportedFunction>::cast(target), sig, &unused,
+         imported_instances, instance, import_index);
+   }
+-  // No wasm function or being debugged. Compile a new wrapper for the new
+-  // signature.
+-  if (FLAG_wasm_jit_to_native) {
+-    Handle<Code> temp_code = compiler::CompileWasmToJSWrapper(
+-        isolate, target, sig, import_index, origin,
+-        instance->compiled_module()->use_trap_handler(), js_imports_table);
+-    return WasmCodeWrapper(
+-        instance->compiled_module()->GetNativeModule()->AddCodeCopy(
+-            temp_code, wasm::WasmCode::kWasmToJsWrapper, import_index));
++
++   // No wasm function or being debugged. Compile a new wrapper for the new
++   // signature.
++   if (FLAG_wasm_jit_to_native) {
++     Handle<Code> temp_code = compiler::CompileWasmToJSWrapper(
++         isolate, target, sig, import_index, origin,
++         instance->compiled_module()->use_trap_handler(), js_imports_table);
++     return WasmCodeWrapper(
++         instance->compiled_module()->GetNativeModule()->AddCodeCopy(
++             temp_code, wasm::WasmCode::kWasmToJsWrapper, import_index));
+   } else {
+     return WasmCodeWrapper(compiler::CompileWasmToJSWrapper(
+         isolate, target, sig, import_index, origin,
+@@ -2873,6 +2874,14 @@ int InstanceBuilder::ProcessImports(Handle<FixedArray> code_table,
+                           module_name, import_name);
+           return -1;
+         }
++        auto target = Handle<JSReceiver>::cast(value);
++        if (!module_->functions[import.index].sig->is_trusted() &&
++            !WasmExportedFunction::IsWasmExportedFunction(*target)) {
++          ReportLinkError("js function provided for untrusted import", index,
++                          module_name, import_name);
++          return -1;
++
++        }
+         WasmCodeWrapper import_code = UnwrapExportOrCompileImportWrapper(
+             isolate_, module_->functions[import.index].sig,
+             Handle<JSReceiver>::cast(value), num_imported_functions,
+-- 
+2.15.0
+
